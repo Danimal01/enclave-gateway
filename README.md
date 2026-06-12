@@ -33,8 +33,7 @@ What you can check yourself:
    (PCR0) that the live attestation reports (see `BUILD.md`).
 
 What you are trusting: AWS Nitro hardware attestation, and the fact that Sessions
-holds the KMS key that unlocks your stored session (so we never claim "we can't
-read you"). These residuals are disclosed, not hidden.
+holds the KMS key that unlocks your stored session. These residuals are disclosed, not hidden.
 
 ## Status
 
