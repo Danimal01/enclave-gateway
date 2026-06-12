@@ -1,0 +1,11 @@
+{
+  "spec": "sessions.fyi/release-manifest/v1",
+  "status": "development",
+  "release_tag": null,
+  "pcr0_g": "351bb9ebe0b4ade6327a50a159eb62a253000d057cfec37e7f8db65f1de8ff88fd160ebea70e5f6ca27f146af5c055dd",
+  "gateway_commit": "c241379",
+  "allowlist_file": "tg-chokepoint.mjs",
+  "allowlist_sha256": "9b363be2742fc374c8d1dcac6663c97a259c446627c669512afe399d3f73349d",
+  "reproducible": true,
+  "note": "Development build. Not yet the attested production release; production releases are tagged + transparency-logged + attestation-bound."
+}

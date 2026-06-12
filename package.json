@@ -1,0 +1,36 @@
+{
+  "name": "sessions-enclave-gateway",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "The Sessions GATEWAY: the small, fully open-source enclave that holds the armed Telegram session and is the only component that can call Telegram through it. Its source IS the complete, exclusive capability ceiling.",
+  "license": "MIT",
+  "main": "gateway.mjs",
+  "files": [
+    "gateway.mjs",
+    "gateway-main.mjs",
+    "connection.mjs",
+    "mtproto-client.mjs",
+    "tg-chokepoint.mjs",
+    "audited-sender.mjs",
+    "policy-verify.mjs",
+    "state-authority.mjs",
+    "state-authority-dynamo.mjs",
+    "brain-protocol.mjs",
+    "brain-admission.mjs",
+    "onboarding.mjs",
+    "onboarding-grant.mjs",
+    "onboarding-channel.mjs",
+    "kms-envelope-v3.mjs",
+    "pg-shim.mjs",
+    "supabase-ca.pem"
+  ],
+  "dependencies": {
+    "@noble/curves": "2.2.0",
+    "@noble/hashes": "2.2.0",
+    "big-integer": "^1.6.52",
+    "pg": "^8.21.0",
+    "telegram": "^2.26.22"
+  },
+  "comment": "Self-contained EIF build context (spec 6.5): zero imports from private monorepo packages. The published mirror sessionsfyi/enclave-gateway is a byte-exact copy of this directory at the built release tag. The brain, app, and State Authority service are NEVER in it."
+}
