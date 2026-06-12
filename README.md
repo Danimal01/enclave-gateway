@@ -37,18 +37,20 @@ holds the KMS key that unlocks your stored session. These residuals are disclose
 
 ## Status
 
-This is the active development source heading toward a tagged, attested
-production release. Production releases are git-tagged, logged in a transparency
-log, and bound to a live enclave attestation; only a tagged release is the
-"this exact code is running" artifact. The current development build reproduces
-to:
+This source is now bound to a LIVE enclave attestation. A genuine AWS Nitro
+enclave running this exact image attests the measurement below, and two
+independent `--no-cache` builds reproduce it. Production releases will
+additionally be git-tagged and logged in a transparency log.
 
 ```
-PCR0_G = 351bb9ebe0b4ade6327a50a159eb62a253000d057cfec37e7f8db65f1de8ff88fd160ebea70e5f6ca27f146af5c055dd
+PCR0_G = ee0d4da90ba7b301e394fcdc0f9f956f19c3b02352a2665c10c9672dd1c122a09c31e1bd60ae0e5ddb729c4f7c0fe241
 ```
 
-This value is reproducible (two independent builds match) but is a development
-build, not yet the attested production release. See `RELEASE.json`.
+Verify it yourself: the live attestation document is published at
+`https://sessions.fyi/attestation/gateway.json` and verified in your browser at
+`https://sessions.fyi/how-it-works` (or with any COSE/Nitro verifier chaining to
+AWS Nitro Root G1). Rebuild this repo and confirm the PCR0 matches. See
+`RELEASE.json`.
 
 ## License
 

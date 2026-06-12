@@ -162,7 +162,25 @@ export async function main() {
   return gateway;
 }
 
-// The EIF runs main(); a crash exits the process and the supervisor restarts it.
+// Re-emit the boot attestation to the parent (vsock :8002) for liveness, so the
+// public proof artifact stays fresh. NSM is local; no network or secrets.
+async function reattest() {
+  try {
+    const { stdout } = await execFileP("/attest", [], { encoding: "utf8", maxBuffer: 1 << 20 });
+    await execFileP("socat", ["-t", "8", "-", "VSOCK-CONNECT:3:8002"], { input: stdout, encoding: "utf8", maxBuffer: 1 << 20 });
+  } catch (e) { console.error("reattest failed:", e?.message); }
+}
+
+// The EIF runs main(). A REAL deployment has a provider (config + creds over
+// vsock) and the gateway adopts + guards. An attestation-only deployment has no
+// provider: main() throws at loadConfig, we log it, and park in ATTESTED STANDBY
+// — the enclave stays alive and re-attests on a cadence rather than crash-
+// looping. Either way the public proof artifact stays live and fresh.
 if (process.env.SESSIONS_GATEWAY_MAIN === "1") {
-  main().catch((e) => { console.error("gateway-main fatal:", e?.message); process.exit(1); });
+  const ATTEST_EVERY_MS = 30 * 60 * 1000;
+  (async () => {
+    try { await main(); console.log("gateway: armed and serving"); }
+    catch (e) { console.error("gateway: attested standby (awaiting provider):", e?.message); }
+    setInterval(reattest, ATTEST_EVERY_MS); // keeps the event loop alive + artifact fresh
+  })().catch((e) => { console.error("gateway-main fatal:", e?.message); process.exit(1); });
 }

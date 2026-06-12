@@ -17,6 +17,12 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund \
  && find node_modules -type d -name obj.target -prune -exec rm -rf {} + 2>/dev/null; \
     find node_modules -type f \( -name '*.o' -o -name 'Makefile' -o -name 'config.gypi' -o -name '*.mk' \) -delete 2>/dev/null; true
+# Boot-time attestation emitter (gateway/attest.c, spec 6.5, Claim A). Compiled
+# against the same libnsm baked into the final image; the binary's bytes are part
+# of PCR0_G, so a stranger rebuilding the mirror reproduces this measurement.
+COPY attest.c /build/attest.c
+COPY libnsm.so /usr/lib64/libnsm.so
+RUN gcc -O2 -o /attest /build/attest.c -L/usr/lib64 -lnsm
 
 FROM public.ecr.aws/amazonlinux/amazonlinux@sha256:df9ca26898d7c01be79e7c84bd008d5c8c867ace2c736421d150179f0aa87c33
 RUN dnf install -y nodejs socat iproute ca-certificates findutils && dnf clean all
@@ -50,8 +56,9 @@ COPY supabase-ca.pem ./
 COPY kmstool_enclave_cli /usr/bin/kmstool_enclave_cli
 COPY libnsm.so /usr/lib64/libnsm.so
 COPY gvforwarder /usr/local/bin/gvforwarder
+COPY --from=builder /attest /attest
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /usr/bin/kmstool_enclave_cli /usr/local/bin/gvforwarder /entrypoint.sh
+RUN chmod +x /usr/bin/kmstool_enclave_cli /usr/local/bin/gvforwarder /attest /entrypoint.sh
 # Determinism: drop install-timestamped state, pin every mtime to a fixed epoch.
 RUN rm -rf /var/lib/rpm /var/lib/dnf /var/cache /var/log /var/tmp/* /root/.npm /tmp/* 2>/dev/null; mkdir -p /tmp; : > /etc/machine-id 2>/dev/null || true; \
     find / -xdev -not -path '/proc/*' -not -path '/sys/*' -not -path '/dev/*' -print0 | xargs -0 touch -h -d @1577836800; true
