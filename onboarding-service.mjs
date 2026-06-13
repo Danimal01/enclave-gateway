@@ -51,7 +51,14 @@ export function makeOnboardingService({ effects, attest, pcr0g, releaseRecordDig
     //    sealed {ok:false} reply; the connection stays usable for retriable steps.
     for (;;) {
       const f = await readFrame();
-      if (!f) return;                 // browser closed
+      if (!f) {
+        // Browser/channel closed mid-ceremony (e.g. a dropped connection). Tear the
+        // ceremony down so its in-memory session, State Authority lease, and the
+        // 'connecting' link row are released -- otherwise prepare() rejects the phone
+        // as "already in flight" on the next attempt until an enclave restart.
+        try { await dispatch({ op: "abort", args: {}, onb, gen, pcr0g, channelKeyHash, ownerEmailFor }); } catch { /* best-effort cleanup */ }
+        return;
+      }
       if (f.type !== "op" || !f.frame) continue;
       let reply;
       try {

@@ -147,11 +147,20 @@ export class OnboardingManager {
     if (!c.sealedRecovery) throw new Error("refusing auth.sendCode before the recovery envelope is durable");
     this._checkTimeouts(c);
     // link routes the effect to THIS ceremony's transport (concurrency-safe).
-    const res = await this._fx.sendCode({ link: c.link, phone: c.phone });
-    c.phoneCodeHash = res.phoneCodeHash;
-    c.status = STATES.CODE_SENT;
-    c.stepAt = this._fx.now();
-    return { isCodeViaApp: res.isCodeViaApp };
+    // A sendCode failure AFTER the recovery commit (e.g. PHONE_NUMBER_INVALID, a
+    // flood, or a DC issue) must tear the ceremony down -- the recovery envelope is
+    // already durable, so leaving it stranded would orphan a live auth key and wedge
+    // the phone. Mirrors authorize's self-teardown.
+    try {
+      const res = await this._fx.sendCode({ link: c.link, phone: c.phone });
+      c.phoneCodeHash = res.phoneCodeHash;
+      c.status = STATES.CODE_SENT;
+      c.stepAt = this._fx.now();
+      return { isCodeViaApp: res.isCodeViaApp };
+    } catch (e) {
+      await this._teardown(onb, `sendCode failed: ${e.message}`);
+      throw e;
+    }
   }
 
   async submitCode({ onb, code }) {

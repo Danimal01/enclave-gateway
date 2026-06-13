@@ -352,6 +352,13 @@ async function emitStatus(msg) {
 // — the enclave stays alive and re-attests on a cadence rather than crash-
 // looping. Either way the public proof artifact stays live and fresh.
 if (process.env.SESSIONS_GATEWAY_MAIN === "1") {
+  // A single ceremony's GramJS auto-reconnect can reject in the background (no
+  // awaiter) or a socket can emit an unhandled 'error'. Without these handlers Node
+  // crashes the WHOLE enclave process -- closing EVERY live channel and surfacing to
+  // the browser as "Lost the secure connection". Per-ceremony failures are already
+  // isolated and torn down by the onboarding manager, so log + survive here.
+  process.on("unhandledRejection", (e) => { try { console.error("unhandledRejection:", e?.message || e); } catch { /* never throw from the handler */ } });
+  process.on("uncaughtException", (e) => { try { console.error("uncaughtException:", e?.message || e); } catch { /* never throw from the handler */ } });
   const ATTEST_EVERY_MS = 30 * 60 * 1000;
   (async () => {
     try {

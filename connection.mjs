@@ -34,10 +34,30 @@ const { MTProtoSender, ConnectionTCPFull } = netPkg;
 const { LAYER } = tlObjects;
 const { StringSession } = sessions;
 
-// Honest device identity on the wire (spec 2.2): deviceModel "Sessions Guard".
-function initConnection(query) {
+// GramJS production DC addresses. The LOW-LEVEL MTProtoSender+ConnectionTCPFull
+// (which we use deliberately, instead of the high-level TelegramClient) has NO
+// built-in default DC table, so an onboarding ceremony with an EMPTY session must
+// be told a concrete IP -- otherwise connect() dials ip:undefined -> localhost ->
+// ECONNREFUSED and the handshake never completes (the "Lost the secure connection"
+// bug). help.getConfig after bring-up can refine these; the parent may override via
+// TG_DC{n}_IP. Source: Telegram production DC list.
+const DEFAULT_DC_IPS = { 1: "149.154.175.53", 2: "149.154.167.51", 3: "149.154.175.100", 4: "149.154.167.91", 5: "91.108.56.130" };
+
+// Resolve a usable cold-connect timeout. GramJS's own connectTimeout is not read in
+// the pinned build, so we bound connect()/bring-up ourselves.
+const CONNECT_TIMEOUT_MS = Number(process.env.TG_CONNECT_TIMEOUT_MS || 20000);
+function withTimeout(p, ms, what) {
+  let t;
+  const timeout = new Promise((_, rej) => { t = setTimeout(() => rej(new Error(`${what} timed out after ${ms}ms`)), ms); });
+  return Promise.race([Promise.resolve(p).finally(() => clearTimeout(t)), timeout]);
+}
+
+// Honest device identity on the wire (spec 2.2): deviceModel "Sessions Guard". apiId
+// comes from the gateway config (passed as a param), NOT process.env (which loadConfig
+// never sets -> would be NaN and reject the InitConnection).
+function initConnection(query, apiId) {
   return new Api.InitConnection({
-    apiId: Number(process.env.TG_API_ID),
+    apiId: Number(apiId),
     deviceModel: "Sessions Guard",
     systemVersion: "1.0",
     appVersion: "1.0",
@@ -72,12 +92,12 @@ export async function makeConnection({ session, mode, apiId, apiHash, onAutoReco
   let updateHandler = null;
   const sender = new MTProtoSender(store.authKey, {
     logger: log,
-    dcId: store.dcId || Number(process.env.TG_DEFAULT_DC || 2),
+    dcId: store.dcId || Number(process.env.TG_DEFAULT_DC || 4),
     retries: 5,
     delay: 1,
     autoReconnect: true,
     connectTimeout: 15000,
-    authKeyCallback: async (authKey, dcId) => { store.setDC(dcId, store.serverAddress, store.port); store.setAuthKey(authKey); },
+    authKeyCallback: async (authKey, dcId) => { store.setDC(dcId, store.serverAddress || DEFAULT_DC_IPS[dcId], store.port || 443); store.setAuthKey(authKey); },
     updateCallback: (update) => { if (updateHandler) updateHandler(update); },
     autoReconnectCallback: async () => { if (onAutoReconnect) await onAutoReconnect(); },
     isMainSender: true,
@@ -93,23 +113,40 @@ export async function makeConnection({ session, mode, apiId, apiHash, onAutoReco
   installAuditedSerialization(sender, chokepoint);
   chokepoint.bindSender(sender);
 
+  // Default DC 4 matches the high-level GramJS client the worker used successfully
+  // (DEFAULT_DC_ID=4); help.getConfig refines the address after bring-up.
+  const defaultDcId = () => store.dcId || Number(process.env.TG_DEFAULT_DC || 4) || 4;
   const dcAddress = (dcId) => {
-    // Production DC IPs are resolved from help.getConfig after bring-up and
-    // cached by the parent; the initial address comes from the loaded session.
-    // For onboarding (empty session) the parent injects the default DC address.
-    if (store.serverAddress && (!dcId || dcId === store.dcId)) return { ip: store.serverAddress, port: store.port || 443, dcId: store.dcId };
-    return { ip: process.env[`TG_DC${dcId}_IP`], port: 443, dcId };
+    // For an ARMED session the address comes from the loaded session. For onboarding
+    // (empty session) resolve a concrete default DC IP -- the low-level sender has no
+    // built-in table, so a missing IP is what dialed localhost and hung the ceremony.
+    const d = dcId || defaultDcId();
+    if (store.serverAddress && d === store.dcId) return { ip: store.serverAddress, port: store.port || 443, dcId: d };
+    const ip = process.env[`TG_DC${d}_IP`] || DEFAULT_DC_IPS[d];
+    if (!ip) throw new Error(`onboarding: no DC IP for dc ${d}`);
+    return { ip, port: 443, dcId: d };
   };
 
   let connected = false;
 
   async function connect() {
     const dc = dcAddress(store.dcId);
+    // Persist the resolved DC into the store BEFORE the handshake so authKeyCallback
+    // and exportSession() carry a concrete address -- otherwise the empty onboarding
+    // session stays addressless and sealRecovery throws 'seal: missing session'.
+    store.setDC(dc.dcId, dc.ip, dc.port);
     const connection = new ConnectionTCPFull({ ip: dc.ip, port: dc.port, dcId: dc.dcId, loggers: log });
-    await sender.connect(connection, false);
+    // sender.connect() RETURNS false (it does not throw) when the socket/handshake
+    // fails after its internal retries; honor that instead of proceeding to a send()
+    // that would hang forever on a dead transport. Bound both legs with a timeout.
+    const ok = await withTimeout(sender.connect(connection, false), CONNECT_TIMEOUT_MS, "MTProto DC connect");
+    if (ok === false) throw new Error(`onboarding: MTProto connect to DC${dc.dcId} (${dc.ip}) failed`);
     // Bring-up: the pinned InvokeWithLayer(InitConnection(help.getConfig)). The
     // chokepoint permits exactly this nesting (InitConnection.query == getConfig).
-    await sender.send(new Api.InvokeWithLayer({ layer: LAYER, query: initConnection(new Api.help.GetConfig()) }));
+    await withTimeout(
+      sender.send(new Api.InvokeWithLayer({ layer: LAYER, query: initConnection(new Api.help.GetConfig(), apiId) })),
+      CONNECT_TIMEOUT_MS, "MTProto bring-up"
+    );
     connected = true;
   }
 
@@ -134,8 +171,12 @@ export async function makeConnection({ session, mode, apiId, apiHash, onAutoReco
     await disconnect();
     store.setDC(targetDcId, target.ip, target.port);
     const connection = new ConnectionTCPFull({ ip: target.ip, port: target.port, dcId: targetDcId, loggers: log });
-    await sender.connect(connection, false);
-    await sender.send(new Api.InvokeWithLayer({ layer: LAYER, query: initConnection(new Api.auth.ImportAuthorization({ id: auth.id, bytes: auth.bytes })) }));
+    const ok = await withTimeout(sender.connect(connection, false), CONNECT_TIMEOUT_MS, "MTProto DC migrate connect");
+    if (ok === false) throw new Error(`onboarding: MTProto migrate-connect to DC${targetDcId} (${target.ip}) failed`);
+    await withTimeout(
+      sender.send(new Api.InvokeWithLayer({ layer: LAYER, query: initConnection(new Api.auth.ImportAuthorization({ id: auth.id, bytes: auth.bytes }), apiId) })),
+      CONNECT_TIMEOUT_MS, "MTProto migrate bring-up"
+    );
     connected = true;
   }
 

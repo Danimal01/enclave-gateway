@@ -92,8 +92,11 @@ export function makeOnboardingEffects({
 
     connect: async (c) => {
       const transport = await makeTransport();
-      await transport.connect();        // mints the auth key (cold handshake)
+      // Store the transport BEFORE connect() so that if the cold handshake throws
+      // (or starts an autoReconnect loop), _teardown -> disconnect can find it and
+      // stop it. Otherwise a failed connect leaks a reconnecting GramJS sender.
       slot(c.link).transport = transport;
+      await transport.connect();        // mints the auth key (cold handshake)
     },
 
     sealRecovery: async ({ link, state, generation, signersCommit, grantDigest }) => {
