@@ -125,9 +125,17 @@ export async function makeArmedTransport({ conn, onNewAuth }) {
       };
     },
     evictSession: async (hash, extraHooks) => {
-      // The chokepoint's evict gate is re-bound to this exact, policy-approved
-      // hash by the gateway dispatcher (assertEvictAllowed in extraHooks).
-      await conn.invoke(new Api.account.ResetAuthorization({ hash: BigInt(hash) }), extraHooks);
+      // Bind the policy-approved hash on the chokepoint so the AUTHORITATIVE
+      // audited seam (audited-sender, which validates WITHOUT per-call hooks) — not
+      // just the API-layer invoke — authorizes exactly this ResetAuthorization. The
+      // seam re-checks the request hash == the bound hash, then it is cleared. (The
+      // per-call extraHooks gate is kept as belt-and-suspenders for the API layer.)
+      conn.chokepoint.bindEvict(hash);
+      try {
+        await conn.invoke(new Api.account.ResetAuthorization({ hash: BigInt(hash) }), extraHooks);
+      } finally {
+        conn.chokepoint.bindEvict(null);
+      }
       return true;
     },
     declineReset: async () => { await conn.invoke(new Api.account.DeclinePasswordReset()); return true; },
@@ -150,4 +158,4 @@ function publicAuthFields(a) {
   };
 }
 
-export { KEEPALIVE_MS };
+export { KEEPALIVE_MS, publicAuthFields };

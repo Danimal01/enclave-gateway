@@ -18,6 +18,7 @@
 import { MODES } from "./tg-chokepoint.mjs";
 import { deriveAuthority, assertOpAllowed } from "./policy-verify.mjs";
 import { decodeRequest, encodeResponse, encodeEvent } from "./brain-protocol.mjs";
+import { Brain } from "./brain.mjs";
 
 export class Gateway {
   // deps:
@@ -68,7 +69,9 @@ export class Gateway {
     // 3. Build the audited armed transport and connect; binding-2 = whoAmI.
     //    The connection (connection.mjs) owns the chokepoint and installs the
     //    audited serialization; the gateway consumes the transport it returns.
-    const tx = await transportFactory({ mode: MODES.ARMED, session: opened.session });
+    //    The transport's typed NEW_AUTH event drives the in-process detection.
+    const handle = `acct-${row.state_id}`;
+    const tx = await transportFactory({ mode: MODES.ARMED, session: opened.session, onNewAuth: (evt) => this._onNewAuth(handle, evt) });
     await tx.connect();
     const me = await tx.whoAmI();
     if (String(me.tgUserId) !== String(row.tg_user_id)) {
@@ -87,13 +90,22 @@ export class Gateway {
       throw new Error(`adopt: policy authority rejected: ${derived.reason}`);
     }
 
-    const handle = `acct-${row.state_id}`;
     const ctx = {
       handle, stateId: row.state_id, linkId: row.id, tgUserId: String(row.tg_user_id),
-      gen, holder, leaseDeadline: lease.localDeadline, tx, authority: derived.authority,
+      gen, holder, leaseDeadline: lease.localDeadline, tx, authority: derived.authority, freshUntil: null,
     };
     this._accts.set(handle, ctx);
     this._byState.set(row.state_id, handle);
+    // Fold-in detection (Option A): the gateway runs the open detection IN-PROCESS.
+    // It can only call the same chokepoint verbs as any gateway code, and its
+    // policy view is the AUTHORITATIVE derived policy (not a separate store), so
+    // the gateway remains the ceiling on everything detection proposes.
+    ctx.brain = new Brain({
+      gateway: { call: (op, arg) => this._call(handle, op, arg) },
+      policyView: async () => this._buildPolicyView(handle),
+      now: this._d.now ?? (() => Date.now()),
+      log: this._d.logger ?? (() => {}),
+    });
     return { handle, gen };
   }
 
@@ -151,9 +163,81 @@ export class Gateway {
     }
   }
 
+  // ---- in-process detection surface (Option A) --------------------------------
+  // The detection engine (brain.mjs) runs inside the gateway and reaches the
+  // account ONLY through these. _call is the in-process equivalent of a decoded
+  // brain request: it dispatches straight to the same op handler that the chokepoint
+  // bounds, so detection can do nothing a remote brain could not.
+  async _call(handle, op, arg) {
+    const ctx = this._ctx(handle);
+    return this._dispatch(ctx, { op, arg });
+  }
+
+  // The policy view detection plans against, built from the AUTHORITATIVE derived
+  // policy (not a separate planning store). Null => watch-only (evict nothing).
+  _buildPolicyView(handle) {
+    const ctx = this._accts.get(handle);
+    if (!ctx?.authority) return null;
+    return {
+      whitelist: new Set((ctx.authority.whitelist ?? []).map(String)),
+      resetProtection: !!ctx.authority.resetProtection,
+      freshUntil: ctx.freshUntil ?? null,
+      authToken: ctx.authority.headHash ?? "in-process",
+    };
+  }
+
+  // React to a typed NEW_AUTH event in-process: an immediate protective sweep.
+  async _onNewAuth(handle, evt) {
+    const ctx = this._accts.get(handle);
+    if (!ctx?.brain) return;
+    try { await ctx.brain.onNewAuth(handle, evt); }
+    catch { /* detection is best-effort; the chokepoint bounds the blast radius */ }
+  }
+
+  // One protective sweep for an adopted account (poll-driven by gateway-main).
+  async sweepAccount(handle) {
+    const ctx = this._accts.get(handle);
+    if (!ctx?.brain) return null;
+    return ctx.brain.sweep(handle);
+  }
+
+  // Periodic poll: sweep + reset-protection check across every adopted account.
+  async sweepAll() {
+    const out = [];
+    for (const handle of [...this._accts.keys()]) {
+      try { out.push({ handle, sweep: await this.sweepAccount(handle) }); }
+      catch (e) { out.push({ handle, error: e.message }); }
+    }
+    return out;
+  }
+
+  async checkSecurityAll() {
+    for (const handle of [...this._accts.keys()]) {
+      const ctx = this._accts.get(handle);
+      if (ctx?.brain) { try { await ctx.brain.checkSecurity(handle); } catch { /* best-effort */ } }
+    }
+  }
+
   // The gateway emits only the typed NEW_AUTH event; the raw stream never crosses.
   encodeNewAuth(acct, body) {
     return encodeEvent({ kind: "NEW_AUTH", acct, body: { hash: body.hash, unconfirmed: body.unconfirmed, device: body.device, location: body.location } });
+  }
+
+  // Count of currently-served accounts (boot/health observability).
+  adoptedCount() { return this._accts.size; }
+
+  // Lease watchdog: renew every adopted account's lease before it expires and
+  // refresh its conservative local deadline. A failed renewal self-fences that
+  // account (5.5): only one unexpired holder may ever serve.
+  async renewAllLeases(ttlMs) {
+    for (const [handle, ctx] of [...this._accts]) {
+      try {
+        const { localDeadline } = await this._d.authorityClient.renewLease(ctx.stateId, ctx.holder, ctx.gen, ttlMs);
+        ctx.leaseDeadline = localDeadline;
+      } catch (e) {
+        await this.selfFence(handle, `lease renewal failed: ${e.message}`);
+      }
+    }
   }
 
   // Self-fence: stop accepting RPC, drop the live sender, zero session material,

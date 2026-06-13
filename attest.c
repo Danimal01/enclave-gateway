@@ -48,13 +48,36 @@ static void b64(const unsigned char *in, unsigned int n) {
     putchar('\n');
 }
 
-int main(void) {
+/* Decode an even-length hex string into out (max cap bytes). Returns the byte
+ * count, or 0 on any malformed input. Used for the optional onboarding-channel
+ * public key passed as argv[1]; it is NOT a secret (it is the ephemeral X25519
+ * public half that the browser binds the attested channel to). */
+static unsigned int hexdecode(const char *s, unsigned char *out, unsigned int cap) {
+    unsigned int n = 0;
+    for (; s[0] && s[1]; s += 2) {
+        int hi = -1, lo = -1;
+        char a = s[0], b = s[1];
+        if (a >= '0' && a <= '9') hi = a - '0'; else if (a >= 'a' && a <= 'f') hi = a - 'a' + 10; else if (a >= 'A' && a <= 'F') hi = a - 'A' + 10;
+        if (b >= '0' && b <= '9') lo = b - '0'; else if (b >= 'a' && b <= 'f') lo = b - 'a' + 10; else if (b >= 'A' && b <= 'F') lo = b - 'A' + 10;
+        if (hi < 0 || lo < 0 || n >= cap) return 0;
+        out[n++] = (unsigned char)((hi << 4) | lo);
+    }
+    if (s[0]) return 0; /* odd length */
+    return n;
+}
+
+int main(int argc, char **argv) {
     int fd = nsm_lib_init();
     if (fd < 0) { fprintf(stderr, "ATTEST_FAIL nsm_lib_init=%d\n", fd); return 1; }
     unsigned char doc[16384];
     unsigned int doclen = sizeof(doc);
     unsigned char ud[] = "sessions-gateway-claim-a";
-    int rc = nsm_get_attestation_doc(fd, ud, (unsigned int)(sizeof(ud) - 1), NULL, 0, NULL, 0, doc, &doclen);
+    /* Optional argv[1]: hex onboarding-channel public key -> attestation public_key
+     * field, so the browser can bind its attested channel to this exact enclave. */
+    unsigned char pk[256];
+    unsigned int pklen = (argc > 1) ? hexdecode(argv[1], pk, sizeof(pk)) : 0;
+    if (argc > 1 && pklen == 0) { fprintf(stderr, "ATTEST_FAIL bad public-key hex\n"); nsm_lib_exit(fd); return 3; }
+    int rc = nsm_get_attestation_doc(fd, ud, (unsigned int)(sizeof(ud) - 1), NULL, 0, pklen ? pk : NULL, pklen, doc, &doclen);
     if (rc != 0) { fprintf(stderr, "ATTEST_FAIL rc=%d\n", rc); nsm_lib_exit(fd); return 2; }
     fprintf(stderr, "ATTEST_OK len=%u\n", doclen);
     printf("ATTDOC:");

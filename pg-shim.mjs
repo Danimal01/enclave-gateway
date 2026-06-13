@@ -229,5 +229,22 @@ export function createPgDb(connectionString) {
     throw new Error("pinned-CA TLS not in force after pool construction — refusing to start");
   }
   pool.on("error", () => {}); // don't crash on idle-client errors; queries surface their own
-  return { from: (table) => new QB(pool, table), _pool: pool };
+
+  // rpc(fn, args): call a public.* function by NAMED args. The function name and
+  // arg names are NOT parameterizable, so they are strictly identifier-validated
+  // (fail closed); every VALUE is a bound parameter. Used only for the gateway-
+  // only seal/onboarding functions (0032). A function RAISE (e.g. a failed seal
+  // CAS) rejects here, so the caller aborts the ceremony rather than proceeding on
+  // a phantom commit.
+  const IDENT = /^[a-z_][a-z0-9_]*$/i;
+  async function rpc(fn, args = {}) {
+    if (!IDENT.test(fn)) throw new Error(`rpc: invalid function name ${fn}`);
+    const keys = Object.keys(args);
+    for (const k of keys) if (!IDENT.test(k)) throw new Error(`rpc: invalid arg name ${k}`);
+    const named = keys.map((k, i) => `${k} => $${i + 1}`).join(", ");
+    const r = await pool.query(`SELECT public.${fn}(${named})`, keys.map((k) => args[k]));
+    return r.rows?.[0] ?? null;
+  }
+
+  return { from: (table) => new QB(pool, table), rpc, _pool: pool };
 }

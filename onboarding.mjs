@@ -75,21 +75,46 @@ export class OnboardingManager {
     return { onb, link, nonce, expiresAt: now + CAPS.TOTAL_MS, pcr0g };
   }
 
+  // C-6 enforcement: every signed candidate field must equal the gateway-held
+  // ceremony value (the gateway generated link_id/state; pcr0_g + channel_key_hash
+  // are the gateway's own; phone + nonce were sealed in at prepare). signers_commit
+  // is separately bound by verifyGrant (== signerGenesis.commit). The nonce is
+  // consumed single-use so a captured grant cannot be replayed within the ceremony.
+  _bindCandidate(c, candidate) {
+    const must = (field, held, got) => {
+      if (held === undefined || held === null || String(held) !== String(got)) {
+        throw new Error(`grant candidate ${field} does not match the gateway-held ceremony value`);
+      }
+    };
+    must("link_id", c.link, candidate?.link_id);
+    must("normalized_phone", c.phone, candidate?.normalized_phone);
+    must("gateway_nonce", c.nonce, candidate?.gateway_nonce);
+    must("pcr0_g", c.pcr0g, candidate?.pcr0_g);
+    must("channel_key_hash", c.channelKeyHash, candidate?.channel_key_hash);
+    if (c.nonceConsumed) throw new Error("grant nonce already consumed");
+    c.nonceConsumed = true;
+  }
+
   // AUTHORIZE: verify the grant against held candidates, create the link row +
   // signer genesis + State Authority onboarding record, acquire the ceremony
   // lease, then connect() (mints the auth_key). RECOVERY seal happens next,
   // BEFORE any login side effect.
-  async authorize({ onb, candidate, authorization, ownerEmail }) {
+  async authorize({ onb, candidate, authorization, ownerEmail, userId }) {
     const c = this._ctx(onb);
     if (c.status !== STATES.PREPARED) throw new Error("authorize out of order");
     this._checkTimeouts(c);
-    // rate caps are authoritative and durable, enforced BEFORE Telegram contact
-    await this._fx.rateCheck({ phone: c.phone, rateKey: candidate.rateKey });
+    // C-6 binding (audit hardening): the SIGNED grant candidate MUST name THIS
+    // ceremony's gateway-held values, not browser-chosen ones, and the nonce is
+    // single-use. The sealed channel already blocks relay substitution; this is the
+    // authoritative enforcement the C-6 claim rests on (no longer transport-only).
+    this._bindCandidate(c, candidate);
+    // Rate caps keyed on the gateway-HELD phone, never an attacker-supplied rateKey.
+    await this._fx.rateCheck({ phone: c.phone, rateKey: c.phone });
 
     const grant = await this._fx.verifyGrant({ candidate, signerGenesis: c.signerGenesis, authorization, nowMs: this._fx.now() });
     if (!grant.ok) { await this._teardown(onb, `grant rejected: ${grant.reason}`); throw new Error(`grant rejected: ${grant.reason}`); }
 
-    await this._fx.createLink({ link: c.link, state: c.state, phone: c.phone, signersCommit: candidate.signers_commit, grantDigest: grant.grantDigest, ownerEmail });
+    await this._fx.createLink({ link: c.link, state: c.state, phone: c.phone, signersCommit: candidate.signers_commit, grantDigest: grant.grantDigest, ownerEmail, userId });
     c.grantDigest = grant.grantDigest;
     c.status = STATES.CONNECTING;
     await this._fx.connect(c);
@@ -109,7 +134,8 @@ export class OnboardingManager {
     const c = this._ctx(onb);
     if (!c.sealedRecovery) throw new Error("refusing auth.sendCode before the recovery envelope is durable");
     this._checkTimeouts(c);
-    const res = await this._fx.sendCode({ phone: c.phone });
+    // link routes the effect to THIS ceremony's transport (concurrency-safe).
+    const res = await this._fx.sendCode({ link: c.link, phone: c.phone });
     c.phoneCodeHash = res.phoneCodeHash;
     c.status = STATES.CODE_SENT;
     c.stepAt = this._fx.now();
@@ -122,11 +148,11 @@ export class OnboardingManager {
     this._checkTimeouts(c);
     c.status = STATES.SIGNING_IN;
     try {
-      await this._fx.signIn({ phone: c.phone, hash: c.phoneCodeHash, code });
+      await this._fx.signIn({ link: c.link, phone: c.phone, hash: c.phoneCodeHash, code });
       return await this._bindAndSeal(c);
     } catch (e) {
       if (e.message === "SESSION_PASSWORD_NEEDED") {
-        const params = await this._fx.getPassword();
+        const params = await this._fx.getPassword({ link: c.link });
         c.status = STATES.AWAIT_SRP_PROOF;
         c.stepAt = this._fx.now();
         return { needPassword: true, srpParams: params };
@@ -147,14 +173,14 @@ export class OnboardingManager {
     if (c.status !== STATES.AWAIT_SRP_PROOF) throw new Error("submitSrpProof out of order");
     this._checkTimeouts(c);
     try {
-      await this._fx.checkPassword({ A, M1 });
+      await this._fx.checkPassword({ link: c.link, A, M1 });
       return await this._bindAndSeal(c);
     } catch (e) {
       if (e.message === "PASSWORD_HASH_INVALID") {
         c.srpGuesses += 1;
         if (c.srpGuesses >= CAPS.SRP_GUESSES) { await this._teardown(onb, "too many SRP guesses"); throw new Error("SRP attempts exhausted"); }
         // srpId/srp_B are single-use: re-issue fresh params on each retry.
-        const params = await this._fx.getPassword();
+        const params = await this._fx.getPassword({ link: c.link });
         return { retry: true, srpParams: params };
       }
       await this._teardown(onb, `fatal checkPassword: ${e.message}`);
@@ -164,7 +190,7 @@ export class OnboardingManager {
 
   async _bindAndSeal(c) {
     c.status = STATES.BINDING;
-    const me = await this._fx.getMe();
+    const me = await this._fx.getMe({ link: c.link });
     c.tgUserId = String(me.tgUserId);
     c.signedIn = true;
     c.status = STATES.SEALING;
@@ -175,9 +201,15 @@ export class OnboardingManager {
     c.recoveryGen = c.recoveryGen + 1;
     c.recoveryDigest = final.envelopeDigest;
     c.status = STATES.DONE;
+    // Capture the session roster for the "keep" step while the transport is still
+    // connected (it is torn down on disconnect below). Best-effort: a failure here
+    // never fails the login — the session is already sealed; the user can review
+    // from the console after arming. listSessions is read-only (getAuthorizations).
+    let sessions = null;
+    try { sessions = (await this._fx.listSessions?.({ link: c.link })) ?? null; } catch { sessions = null; }
     await this._fx.disconnect?.(c);
     this._sessions.delete(c.onb);
-    return { done: true, tgUserId: c.tgUserId, firstName: me.firstName, username: me.username };
+    return { done: true, tgUserId: c.tgUserId, firstName: me.firstName, username: me.username, sessions };
   }
 
   abort({ onb }) { return this._teardown(onb, "aborted by user"); }

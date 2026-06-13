@@ -144,10 +144,42 @@ export function makeChokepoint({ mode, hooks = {} }) {
   const MODE = mode;          // captured, no setter exists
   let SENDER = null;          // module-private; never exported or re-readable
 
+  // Op-scoped, module-private grants the GATEWAY sets around a privileged op and
+  // the AUDITED SEAM consumes (audited-sender.mjs calls assertAllowed WITHOUT
+  // per-op hooks, so a per-call extraHook never reaches the seam — these do). Only
+  // the gateway's own transport code can set them; a relayed/brain frame cannot,
+  // because bindEvict/bindTeardown are not on any wire path. The seam still
+  // re-validates the EXACT request against the bound value (the bound evict hash
+  // must equal the request hash), so this grants nothing beyond the one op the
+  // policy layer already approved.
+  let boundEvict = null;      // policy-approved ResetAuthorization hash, for the duration of the evict
+  let boundTeardown = false;  // internal onboarding auth.logOut teardown, for the duration of the logout
+
+  // Effective hooks: fold the op-scoped grants into the base + per-call hooks so
+  // they reach assertAllowed at BOTH the API layer and the audited seam.
+  function eff(extraHooks) {
+    const merged = { ...hooks, ...extraHooks };
+    const userEvict = merged.assertEvictAllowed;
+    return {
+      ...merged,
+      // checkLeaf calls this only for account.ResetAuthorization.
+      assertEvictAllowed: (hash) => {
+        if (boundEvict !== null && String(hash) === boundEvict) return;   // exactly the policy-approved hash
+        if (typeof userEvict === "function") return userEvict(hash);      // explicit per-call gate (direct callers/tests)
+        throw new Error("BLOCKED evict without a bound policy gate");
+      },
+      // checkLeaf reads this only for auth.logOut in ONBOARDING mode.
+      onboardingTeardown: boundTeardown === true || merged.onboardingTeardown === true,
+    };
+  }
+
   return Object.freeze({
     get mode() { return MODE; },
+    // Gateway-only op-scoped grants (set immediately before the op, cleared after).
+    bindEvict(hash) { boundEvict = (hash === null || hash === undefined) ? null : String(hash); },
+    bindTeardown(on) { boundTeardown = on === true; },
     assertAllowed(request, extraHooks) {
-      assertAllowed(request, MODE, { ...hooks, ...extraHooks });
+      assertAllowed(request, MODE, eff(extraHooks));
     },
     bindSender(s) {
       if (SENDER !== null) throw new Error("sender already bound");
@@ -156,7 +188,7 @@ export function makeChokepoint({ mode, hooks = {} }) {
     },
     async send(request, extraHooks) {
       if (SENDER === null) throw new Error("no sender bound");
-      assertAllowed(request, MODE, { ...hooks, ...extraHooks });
+      assertAllowed(request, MODE, eff(extraHooks));
       return SENDER.send(request);
     },
   });

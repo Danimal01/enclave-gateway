@@ -2,17 +2,17 @@
   "spec": "sessions.fyi/release-manifest/v1",
   "status": "attested-development",
   "release_tag": null,
-  "pcr0_g": "ee0d4da90ba7b301e394fcdc0f9f956f19c3b02352a2665c10c9672dd1c122a09c31e1bd60ae0e5ddb729c4f7c0fe241",
-  "gateway_commit": "e795ed9",
+  "pcr0_g": "b84930d987ca49b6dba75ca63261356a15ccfb90c752d40b8a89376942cd1726f5d4b6c2d68ad24cf9950a9178cad9a8",
+  "gateway_commit": null,
   "allowlist_file": "tg-chokepoint.mjs",
-  "allowlist_sha256": "9b363be2742fc374c8d1dcac6663c97a259c446627c669512afe399d3f73349d",
+  "allowlist_sha256": "42dbe2410ceb2eca9bc2f899257326673b54a3592832b62f244b589019ce6e23",
   "reproducible": true,
   "attestation": {
     "module_id": "i-0aa6b63b57d3e239f-enc019ebad1f2a1422b",
-    "attested_at_iso": "2026-06-12T07:53:09.744Z",
+    "attested_at_iso": null,
     "live_artifact": "https://sessions.fyi/attestation/gateway.json",
     "verifier": "https://sessions.fyi/how-it-works",
-    "note": "A live AWS Nitro enclave running this exact image attests PCR0_G above. Two independent --no-cache builds of this repo reproduce it. Verify the published artifact in your browser, or with any COSE/Nitro verifier chaining to AWS Nitro Root G1."
+    "note": "A live AWS Nitro enclave running this exact image attests PCR0_G above; two independent --no-cache builds reproduce it (2026-06-13). Includes the pre-launch security-audit fixes."
   },
-  "note": "Attested development build: a genuine Nitro enclave attests this PCR0_G and it is reproducible from this source. Production releases will additionally be git-tagged and transparency-logged."
+  "note": "Attested build (post security audit). Audit fixes folded in: settable-GUC seal-fence -> current_user identity; OnboardingGrant candidate binding + single-use nonce; armed evict + onboarding teardown now authorize at the audited seam; rate-key derived from held phone."
 }

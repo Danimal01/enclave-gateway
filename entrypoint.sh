@@ -33,6 +33,10 @@ ip route add default via 192.168.127.1 2>/dev/null || true
 rm -f /etc/resolv.conf; echo "nameserver 192.168.127.1" > /etc/resolv.conf
 /usr/local/bin/gvforwarder -url vsock://3:1024/connect -preexisting 2>/dev/null &
 
+# Enclave-born onboarding: the parent relays each browser session to this enclave's
+# vsock :8005; bridge it to the gateway's local onboarding server (127.0.0.1:9005).
+socat VSOCK-LISTEN:8005,fork,reuseaddr TCP-CONNECT:127.0.0.1:9005 2>/dev/null &
+
 cd /app
 # gateway-main.mjs wires the published modules to the real enclave effects
 # (kmstool transport, GramJS connection, vsock relays). It is the EIF entrypoint.

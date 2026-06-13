@@ -36,7 +36,11 @@ COPY connection.mjs ./
 COPY pg-shim.mjs ./
 COPY onboarding.mjs ./
 COPY onboarding-grant.mjs ./
+COPY arm.mjs ./
 COPY onboarding-channel.mjs ./
+COPY onboarding-transport.mjs ./
+COPY onboarding-serve.mjs ./
+COPY onboarding-service.mjs ./
 COPY mtproto-client.mjs ./
 COPY tg-chokepoint.mjs ./
 COPY audited-sender.mjs ./
@@ -45,6 +49,7 @@ COPY state-authority.mjs ./
 COPY state-authority-dynamo.mjs ./
 COPY brain-protocol.mjs ./
 COPY brain-admission.mjs ./
+COPY brain.mjs ./
 COPY kms-envelope-v3.mjs ./
 # Pinned roots baked into the measured image: the Nitro attestation root, the
 # Supabase CA, and the patched kmstool (genkey + encryption-context, spec 5.6).

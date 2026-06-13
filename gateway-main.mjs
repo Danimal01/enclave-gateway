@@ -23,15 +23,23 @@
 // Until the batched Nitro rebuild, this entrypoint is NOT exercised; the EIF it
 // produces is validated by the captured-wire suite before any cutover.
 
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
+import { randomUUID } from "node:crypto";
+import net from "node:net";
 import { Gateway } from "./gateway.mjs";
-import { makeKmstoolTransport, openEnvelopeV3 } from "./kms-envelope-v3.mjs";
+import { makeKmstoolTransport, openEnvelopeV3, sealEnvelopeV3, envelopeDigest, newContextId, zeroize } from "./kms-envelope-v3.mjs";
+import { makeArmCompleter } from "./arm.mjs";
 import { StateAuthorityClient } from "./state-authority.mjs";
 import { makeArmedTransport } from "./mtproto-client.mjs";
 import { makeConnection } from "./connection.mjs";
+import { MODES } from "./tg-chokepoint.mjs";
 import { deriveAuthority } from "./policy-verify.mjs";
 import { createPgDb } from "./pg-shim.mjs";
+import { makeOnboardingTransport } from "./onboarding-transport.mjs";
+import { makeOnboardingEffects } from "./onboarding-serve.mjs";
+import { makeOnboardingService } from "./onboarding-service.mjs";
+import { verifyOnboardingGrant } from "./onboarding-grant.mjs";
 
 const execFileP = promisify(execFile);
 
@@ -105,6 +113,17 @@ async function loadConfig() {
     WEBAUTHN_RP_ID: config.WEBAUTHN_RP_ID || "",
     WEBAUTHN_ORIGINS: webauthnOrigins,
     GOOGLE_CLIENT_ID: config.GOOGLE_CLIENT_ID || config.NEXT_PUBLIC_GOOGLE_CLIENT_ID || "",
+    // Onboarding channel binds these so the browser can match the published release.
+    // They are PUBLIC (a PCR0 + a release digest), not secrets, and they change on
+    // every reproducible rebuild — so the PARENT injects them at runtime (p.*),
+    // authoritative over any value baked into the sealed secret config. This means a
+    // rebuild never requires re-sealing the secret config: only the parent's
+    // pcr0_g/release_record_digest are updated. (Falls back to the sealed config for
+    // backward compatibility.) The browser still verifies the REAL measured PCR0 from
+    // the live attestation against the published release record, so a wrong injected
+    // value cannot forge "verified" — it would only mis-claim in the grant candidate.
+    PCR0_G: p.pcr0_g || config.PCR0_G || "",
+    RELEASE_RECORD_DIGEST: p.release_record_digest || config.RELEASE_RECORD_DIGEST || "",
     db,
     // State Authority relay: one request/response per call over vsock :8003. The
     // parent relays opaque frames to the security account; it cannot forge a
@@ -146,20 +165,156 @@ export async function main() {
     // connection owns its chokepoint and installs the audited serialization (the
     // two write sites are in connection.mjs, host-validated by the captured-wire
     // suite); makeArmedTransport just wraps it into the high-level op surface.
-    transportFactory: async ({ mode, session }) => {
+    transportFactory: async ({ mode, session, onNewAuth }) => {
       const conn = await makeConnection({ session, mode, apiId: cfg.TG_API_ID, apiHash: cfg.TG_API_HASH, onAutoReconnect: cfg.onAutoReconnect, logger: cfg.logger });
-      return makeArmedTransport({ conn, onNewAuth: (evt) => cfg.emitNewAuth(evt) });
+      // onNewAuth is supplied per-account by the gateway and drives the in-process
+      // detection sweep (Option A); fall back to a no-op if absent.
+      return makeArmedTransport({ conn, onNewAuth: onNewAuth ?? ((evt) => cfg.emitNewAuth(evt)) });
     },
     now: () => Date.now(),
     monotonic: () => Number(process.hrtime.bigint() / 1_000_000n),
   });
 
-  // HOST: adopt all armed links (read State Authority -> acquire lease -> KMS
-  // open -> binding-1/2 -> derive authority -> serve), then accept the brain
-  // channel (Brain Admission) and the browser onboarding channel. The lease
-  // watchdog renews on cadence and self-fences before expiry (5.5).
+  // HOST: adopt all armed v3 links (read State Authority -> acquire lease -> KMS
+  // open -> binding-1/2 -> derive authority -> serve), then run the in-process
+  // detection (Option A) on a poll, and a lease watchdog that renews on cadence
+  // and self-fences before expiry (5.5).
   void deriveAuthority; // used inside Gateway.adopt
+  const holder = "gw-" + randomUUID();
+  const LEASE_TTL_MS = 60_000, RENEW_MS = 20_000, SWEEP_MS = 5 * 60_000;
+
+  // ARM completion (Piece 2b): when the backend has written a signed v1 policy
+  // genesis for a CONNECTED link, the gateway re-verifies it, re-seals FINAL under
+  // signersCommit(v1), promotes the State Authority record to ARMED, and flips
+  // status->armed. Only the enclave can (it alone re-opens the sealed session).
+  const armCompleter = makeArmCompleter({
+    db: cfg.db, kms, openEnvelopeV3, sealEnvelopeV3, envelopeDigest, newContextId, zeroize,
+    freshCreds, authorityClient, holder,
+    verifierCfg: { rpId: cfg.WEBAUTHN_RP_ID, origins: cfg.WEBAUTHN_ORIGINS, googleClientId: cfg.GOOGLE_CLIENT_ID },
+    now: () => Date.now(),
+  });
+  const ARM_SWEEP_MS = 15_000;
+
+  // Complete any pending arms first, then adopt every armed v3 link.
+  await armCompleter.sweepPendingArms().catch((e) => console.error("arm sweep:", e?.message));
+  await adoptArmedLinks(gateway, cfg.db, holder, LEASE_TTL_MS);
+
+  // Lease watchdog: renew every adopted lease before it expires; a failed renewal
+  // self-fences that account (drops the live sender, zeroes session material).
+  setInterval(() => { gateway.renewAllLeases(LEASE_TTL_MS).catch((e) => console.error("lease renew:", e?.message)); }, RENEW_MS);
+  // Detection poll: a protective sweep + reset-protection check across all accounts.
+  setInterval(() => { gateway.sweepAll().catch(() => {}); gateway.checkSecurityAll().catch(() => {}); }, SWEEP_MS);
+  // Arm poll: complete pending arms, then adopt the newly-armed links.
+  setInterval(() => {
+    armCompleter.sweepPendingArms()
+      .then((r) => { if (r && r.completed > 0) return adoptArmedLinks(gateway, cfg.db, holder, LEASE_TTL_MS); })
+      .catch((e) => console.error("arm poll:", e?.message));
+  }, ARM_SWEEP_MS);
+
+  // Serve enclave-born onboarding over the attested channel (4.10). The parent
+  // relays each browser session to vsock :8005, bridged to this local server.
+  startOnboardingService({ cfg, kms, authorityClient, holder });
+
   return gateway;
+}
+
+// ── enclave-born onboarding service (4.10) ───────────────────────────────────
+// Attest WITH a per-ceremony X25519 public key (attest.c argv[1] = hex pubkey),
+// so the browser can bind the channel to this exact enclave.
+async function attestWithKey(hexPubkey) {
+  const { stdout } = await execFileP("/attest", [hexPubkey], { encoding: "utf8", maxBuffer: 1 << 20 });
+  const m = stdout.match(/ATTDOC:([A-Za-z0-9+/=]+)/);
+  if (!m) throw new Error("attest: no ATTDOC in output");
+  return m[1].trim();
+}
+
+// Wrap a socket as the {readFrame, writeFrame} the service expects: newline-
+// delimited JSON frames. The parent's vsock relay shuttles these to the browser.
+function frameTransport(socket) {
+  let buf = "";
+  const queue = [], waiters = [];
+  socket.setEncoding("utf8");
+  const deliver = (f) => { const w = waiters.shift(); if (w) w(f); else queue.push(f); };
+  socket.on("data", (chunk) => {
+    buf += chunk;
+    let i;
+    while ((i = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, i); buf = buf.slice(i + 1);
+      if (!line.trim()) continue;
+      let frame; try { frame = JSON.parse(line); } catch { continue; }
+      deliver(frame);
+    }
+  });
+  socket.on("end", () => deliver(null));
+  socket.on("close", () => deliver(null));
+  return {
+    readFrame: () => (queue.length ? Promise.resolve(queue.shift()) : new Promise((r) => waiters.push(r))),
+    writeFrame: async (f) => { if (f === null) { try { socket.end(); } catch { /* closing */ } return; } socket.write(JSON.stringify(f) + "\n"); },
+  };
+}
+
+function startOnboardingService({ cfg, kms, authorityClient, holder }) {
+  const makeTransport = async () => {
+    const conn = await makeConnection({ session: "", mode: MODES.ONBOARDING, apiId: cfg.TG_API_ID, apiHash: cfg.TG_API_HASH, onAutoReconnect: cfg.onAutoReconnect, logger: cfg.logger });
+    return makeOnboardingTransport({ conn, apiId: cfg.TG_API_ID, apiHash: cfg.TG_API_HASH });
+  };
+  const effects = makeOnboardingEffects({
+    db: cfg.db, kms, freshCreds, authorityClient, makeTransport, holder, now: () => Date.now(),
+    verifyGrant: ({ candidate, signerGenesis, authorization, nowMs }) =>
+      verifyOnboardingGrant({ candidate, signerGenesis, authorization, nowMs, cfg: { rpId: cfg.WEBAUTHN_RP_ID, origins: cfg.WEBAUTHN_ORIGINS, googleClientId: cfg.GOOGLE_CLIENT_ID } }),
+  });
+  const svc = makeOnboardingService({
+    effects, attest: attestWithKey,
+    pcr0g: cfg.PCR0_G ?? "", releaseRecordDigest: cfg.RELEASE_RECORD_DIGEST ?? "",
+  });
+  const server = net.createServer((socket) => {
+    socket.on("error", () => { /* client gone */ });
+    svc.handleConnection(frameTransport(socket)).catch(() => { try { socket.destroy(); } catch { /* gone */ } });
+  });
+  server.on("error", (e) => console.error("onboarding server:", e?.message));
+  server.listen(9005, "127.0.0.1", () => console.log("onboarding service on 127.0.0.1:9005"));
+  return server;
+}
+
+// Read every armed, version-3 FINAL link as the narrow guard_gateway role and
+// adopt each. A failed adopt for one link is logged and skipped; the others still
+// come up. With no v3 links yet (pre-onboarding) this is a clean no-op.
+async function adoptArmedLinks(gateway, db, holder, ttlMs) {
+  let rows = [];
+  try {
+    const r = await db.from("telegram_links")
+      .select("id,state_id,tg_user_id,signers_commit,seal_generation,kms_context_id,seal_encrypted_data_key,seal_nonce,seal_ciphertext,seal_tag")
+      .eq("status", "armed").eq("seal_version", 3).eq("seal_phase", "FINAL");
+    rows = r?.data ?? r ?? [];
+  } catch (e) {
+    console.error("adopt: armed-link query failed:", e?.message);
+    return;
+  }
+  let adopted = 0;
+  for (const row of rows) {
+    try {
+      const { handle } = await gateway.adopt(row, holder, ttlMs);
+      adopted += 1;
+      gateway.sweepAccount(handle).catch(() => {}); // immediate protective sweep on adopt
+    } catch (e) {
+      console.error("adopt: link", row.id, "failed:", e?.message);
+    }
+  }
+  console.log(`gateway: adopted ${adopted}/${rows.length} armed link(s)`);
+}
+
+// Pipe a payload to a parent vsock port through socat by WRITING the child's
+// stdin. execFile has no `input` option (only spawnSync/execSync do), so the old
+// execFile({input}) silently sent nothing -- the bug that broke node-driven
+// re-attestation and status emits while the entrypoint's shell-piped boot attest
+// kept working.
+function pipeToParentVsock(port, payload) {
+  return new Promise((resolve) => {
+    const child = spawn("socat", ["-t", "8", "-", `VSOCK-CONNECT:3:${port}`]);
+    child.on("error", () => resolve());
+    child.on("close", () => resolve());
+    try { child.stdin.write(payload); child.stdin.end(); } catch { resolve(); }
+  });
 }
 
 // Re-emit the boot attestation to the parent (vsock :8002) for liveness, so the
@@ -167,8 +322,16 @@ export async function main() {
 async function reattest() {
   try {
     const { stdout } = await execFileP("/attest", [], { encoding: "utf8", maxBuffer: 1 << 20 });
-    await execFileP("socat", ["-t", "8", "-", "VSOCK-CONNECT:3:8002"], { input: stdout, encoding: "utf8", maxBuffer: 1 << 20 });
+    await pipeToParentVsock(8002, stdout);
   } catch (e) { console.error("reattest failed:", e?.message); }
+}
+
+// Boot/health observability: production enclaves have no console, so emit a one-
+// line status to the parent (vsock :8004). Carries NO secret: just whether the
+// gateway came up in full mode (and how many links it serves) or parked in
+// standby with the reason. The parent listener logs it.
+async function emitStatus(msg) {
+  await pipeToParentVsock(8004, `GWSTATUS:${msg}\n`);
 }
 
 // The EIF runs main(). A REAL deployment has a provider (config + creds over
@@ -179,8 +342,14 @@ async function reattest() {
 if (process.env.SESSIONS_GATEWAY_MAIN === "1") {
   const ATTEST_EVERY_MS = 30 * 60 * 1000;
   (async () => {
-    try { await main(); console.log("gateway: armed and serving"); }
-    catch (e) { console.error("gateway: attested standby (awaiting provider):", e?.message); }
+    try {
+      const gw = await main();
+      console.log("gateway: armed and serving");
+      await emitStatus(`READY adopted=${gw.adoptedCount()}`);
+    } catch (e) {
+      console.error("gateway: attested standby:", e?.message);
+      await emitStatus(`STANDBY ${String(e?.message || e).slice(0, 220)}`);
+    }
     setInterval(reattest, ATTEST_EVERY_MS); // keeps the event loop alive + artifact fresh
   })().catch((e) => { console.error("gateway-main fatal:", e?.message); process.exit(1); });
 }
