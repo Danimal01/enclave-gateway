@@ -24,6 +24,7 @@
 // permitted low-level path; the banned paths are telegram/client/* (the helpers).
 import pkg from "telegram";
 import netPkg from "telegram/network/index.js";
+import extPkg from "telegram/extensions/index.js";
 import tlObjects from "telegram/tl/AllTLObjects.js";
 import { makeChokepoint, MODES } from "./tg-chokepoint.mjs";
 import { installAuditedSerialization } from "./audited-sender.mjs";
@@ -31,6 +32,7 @@ import { makeNoOpEntityCache } from "./mtproto-client.mjs";
 
 const { Api, Logger, sessions } = pkg;
 const { MTProtoSender, ConnectionTCPFull } = netPkg;
+const { PromisedNetSockets } = extPkg;
 const { LAYER } = tlObjects;
 const { StringSession } = sessions;
 
@@ -90,6 +92,11 @@ export async function makeConnection({ session, mode, apiId, apiHash, onAutoReco
   });
 
   let updateHandler = null;
+  // MTProtoSender assumes its client context supplies the socket constructor
+  // during reconnects and an optional top-level error hook. The high-level
+  // TelegramClient normally provides this object; our low-level client must do
+  // so explicitly.
+  const senderClient = { networkSocket: PromisedNetSockets, _errorHandler: null };
   const sender = new MTProtoSender(store.authKey, {
     logger: log,
     dcId: store.dcId || Number(process.env.TG_DEFAULT_DC || 4),
@@ -98,10 +105,11 @@ export async function makeConnection({ session, mode, apiId, apiHash, onAutoReco
     autoReconnect: true,
     connectTimeout: 15000,
     authKeyCallback: async (authKey, dcId) => { store.setDC(dcId, store.serverAddress || DEFAULT_DC_IPS[dcId], store.port || 443); store.setAuthKey(authKey); },
-    updateCallback: (update) => { if (updateHandler) updateHandler(update); },
+    updateCallback: (_client, update) => { if (updateHandler) updateHandler(update); },
     autoReconnectCallback: async () => { if (onAutoReconnect) await onAutoReconnect(); },
     isMainSender: true,
     securityChecks: true,
+    client: senderClient,
   });
 
   // H-2: disable the entity cache so no peer entity from a message update or RPC
@@ -135,7 +143,10 @@ export async function makeConnection({ session, mode, apiId, apiHash, onAutoReco
     // and exportSession() carry a concrete address -- otherwise the empty onboarding
     // session stays addressless and sealRecovery throws 'seal: missing session'.
     store.setDC(dc.dcId, dc.ip, dc.port);
-    const connection = new ConnectionTCPFull({ ip: dc.ip, port: dc.port, dcId: dc.dcId, loggers: log });
+    const connection = new ConnectionTCPFull({
+      ip: dc.ip, port: dc.port, dcId: dc.dcId, loggers: log,
+      socket: PromisedNetSockets,
+    });
     // sender.connect() RETURNS false (it does not throw) when the socket/handshake
     // fails after its internal retries; honor that instead of proceeding to a send()
     // that would hang forever on a dead transport. Bound both legs with a timeout.
@@ -170,7 +181,10 @@ export async function makeConnection({ session, mode, apiId, apiHash, onAutoReco
     const target = dcAddress(targetDcId);
     await disconnect();
     store.setDC(targetDcId, target.ip, target.port);
-    const connection = new ConnectionTCPFull({ ip: target.ip, port: target.port, dcId: targetDcId, loggers: log });
+    const connection = new ConnectionTCPFull({
+      ip: target.ip, port: target.port, dcId: targetDcId, loggers: log,
+      socket: PromisedNetSockets,
+    });
     const ok = await withTimeout(sender.connect(connection, false), CONNECT_TIMEOUT_MS, "MTProto DC migrate connect");
     if (ok === false) throw new Error(`onboarding: MTProto migrate-connect to DC${targetDcId} (${target.ip}) failed`);
     await withTimeout(
