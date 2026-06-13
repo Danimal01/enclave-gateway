@@ -108,24 +108,36 @@ export class OnboardingManager {
     // single-use. The sealed channel already blocks relay substitution; this is the
     // authoritative enforcement the C-6 claim rests on (no longer transport-only).
     this._bindCandidate(c, candidate);
-    // Rate caps keyed on the gateway-HELD phone, never an attacker-supplied rateKey.
-    await this._fx.rateCheck({ phone: c.phone, rateKey: c.phone });
+    // Any failure from here on (rate cap, grant reject, createLink, the Telegram
+    // cold-connect, or the recovery seal) MUST tear down this ceremony. Otherwise the
+    // in-memory session lingers and prepare() rejects the phone as "already in flight"
+    // for every subsequent attempt -- a single failed try wedged the number until an
+    // enclave restart. _teardown is idempotent and never throws.
+    try {
+      const grant = await this._fx.verifyGrant({ candidate, signerGenesis: c.signerGenesis, authorization, nowMs: this._fx.now() });
+      if (!grant.ok) throw new Error(`grant rejected: ${grant.reason}`);
 
-    const grant = await this._fx.verifyGrant({ candidate, signerGenesis: c.signerGenesis, authorization, nowMs: this._fx.now() });
-    if (!grant.ok) { await this._teardown(onb, `grant rejected: ${grant.reason}`); throw new Error(`grant rejected: ${grant.reason}`); }
+      // Rate caps keyed on the gateway-HELD phone (never an attacker-supplied
+      // rateKey), AFTER the grant verifies so a failed/invalid signature can't burn a
+      // legitimate user's sendCode budget (3/24h) and lock them out.
+      await this._fx.rateCheck({ phone: c.phone, rateKey: c.phone });
 
-    await this._fx.createLink({ link: c.link, state: c.state, phone: c.phone, signersCommit: candidate.signers_commit, grantDigest: grant.grantDigest, ownerEmail, userId });
-    c.grantDigest = grant.grantDigest;
-    c.status = STATES.CONNECTING;
-    await this._fx.connect(c);
+      await this._fx.createLink({ link: c.link, state: c.state, phone: c.phone, signersCommit: candidate.signers_commit, grantDigest: grant.grantDigest, ownerEmail, userId });
+      c.grantDigest = grant.grantDigest;
+      c.status = STATES.CONNECTING;
+      await this._fx.connect(c);
 
-    // RECOVERY_SEAL: commit RECOVERY(1) BEFORE sendCode.
-    c.status = STATES.RECOVERY_SEAL;
-    const seal = await this._fx.sealRecovery({ link: c.link, state: c.state, generation: 1, signersCommit: candidate.signers_commit, grantDigest: grant.grantDigest });
-    c.recoveryGen = 1;
-    c.recoveryDigest = seal.envelopeDigest;
-    c.sealedRecovery = true;
-    return { onb, status: c.status };
+      // RECOVERY_SEAL: commit RECOVERY(1) BEFORE sendCode.
+      c.status = STATES.RECOVERY_SEAL;
+      const seal = await this._fx.sealRecovery({ link: c.link, state: c.state, generation: 1, signersCommit: candidate.signers_commit, grantDigest: grant.grantDigest });
+      c.recoveryGen = 1;
+      c.recoveryDigest = seal.envelopeDigest;
+      c.sealedRecovery = true;
+      return { onb, status: c.status };
+    } catch (e) {
+      await this._teardown(onb, `authorize failed: ${e.message}`);
+      throw e;
+    }
   }
 
   // After the recovery commit, send the login code. HARD ORDER: this throws if

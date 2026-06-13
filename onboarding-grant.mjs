@@ -26,7 +26,6 @@ import { keccak_256 } from "@noble/hashes/sha3.js";
 
 export const GRANT_DOMAIN = "sessions.fyi/onboard/v1";
 const GRANT_TTL_MAX_MS = 15 * 60 * 1000;
-const ORIGIN = "https://sessions.fyi";
 
 // Canonical grant hash. Field order is fixed and published; every field is
 // length-tagged via JSON of an ordered object so no two field tuples collide.
@@ -91,16 +90,27 @@ function coseToKey(cose) {
 // Passkey: WebAuthn assertion over the grant hash, origin pinned to exactly
 // https://sessions.fyi, type webauthn.get or webauthn.create (ceremony), and
 // challenge === grant hash. Closes same-RP cross-context signature reuse.
-function verifyPasskeyGrant(hash, auth, signer) {
+function verifyPasskeyGrant(hash, auth, signer, cfg = {}) {
   if (auth.credentialId !== signer.credId) return false;
   const clientDataBytes = Buffer.from(auth.clientDataJSON, "base64url");
   const clientData = JSON.parse(clientDataBytes.toString("utf8"));
   if (clientData.type !== "webauthn.get" && clientData.type !== "webauthn.create") return false;
-  if (clientData.origin !== ORIGIN) return false;             // EXACTLY, not includes
+  // The site serves on www.sessions.fyi (the apex 308-redirects to www), so a real
+  // passkey assertion's origin is https://www.sessions.fyi -- NOT the apex the old
+  // hardcoded ORIGIN pinned. Check a CLOSED allowlist (still exact-equality, not a
+  // substring/wildcard) built from the configured origins plus the apex+www pair
+  // derived from rpId, so this holds regardless of the sealed config's origin list.
+  const rpId = cfg.rpId || "sessions.fyi";
+  const allowedOrigins = new Set([
+    ...(Array.isArray(cfg.origins) ? cfg.origins : []),
+    `https://${rpId}`,
+    `https://www.${rpId}`,
+  ]);
+  if (!allowedOrigins.has(clientData.origin)) return false;
   if (clientData.challenge !== hash) return false;            // challenge IS the grant hash
   const authData = Buffer.from(auth.authenticatorData, "base64url");
   if (authData.length < 37) return false;
-  const rpIdHash = createHash("sha256").update("sessions.fyi").digest();
+  const rpIdHash = createHash("sha256").update(rpId).digest();
   if (!authData.subarray(0, 32).equals(rpIdHash)) return false;
   if ((authData[32] & 0x01) === 0) return false;              // user present
   const signedData = Buffer.concat([authData, createHash("sha256").update(clientDataBytes).digest()]);
@@ -190,7 +200,7 @@ export async function verifyOnboardingGrant({ candidate, signerGenesis, authoriz
   const hash = grantHash(candidate);
   let ok = false;
   try {
-    if (authorization.kind === "passkey") ok = verifyPasskeyGrant(hash, authorization, signerGenesis);
+    if (authorization.kind === "passkey") ok = verifyPasskeyGrant(hash, authorization, signerGenesis, cfg);
     else if (authorization.kind === "wallet") ok = verifyWalletGrant(hash, authorization, signerGenesis);
     else if (authorization.kind === "google") ok = await verifyGoogleGrant(hash, authorization, signerGenesis, { ...cfg, nowMs });
     else return bad(`unknown authorization kind ${authorization.kind}`);
