@@ -128,12 +128,24 @@ async function loadConfig() {
     // State Authority relay: one request/response per call over vsock :8003. The
     // parent relays opaque frames to the security account; it cannot forge a
     // signed response (verified in StateAuthorityClient against the pinned key).
-    stateAuthorityTransport: async (method, args) => {
-      const { stdout } = await execFileP("socat", ["-t", "20", "-", `VSOCK-CONNECT:${PROVIDER_CID}:${STATE_AUTHORITY_PORT}`], {
-        encoding: "utf8", maxBuffer: 1 << 20, input: JSON.stringify({ method, args }),
+    // MUST write the child's stdin via spawn: execFile has no `input` option (only
+    // spawnSync/execSync do), so the old execFile({input}) sent NOTHING and the
+    // parent sa-service hung forever reading stdin -- the bug that froze the first
+    // live onboarding at `authorize` (createOnboardingIfAbsent). Same fix family as
+    // pipeToParentVsock, but this path needs the response back, so capture stdout.
+    stateAuthorityTransport: (method, args) => new Promise((resolve, reject) => {
+      const child = spawn("socat", ["-t", "20", "-", `VSOCK-CONNECT:${PROVIDER_CID}:${STATE_AUTHORITY_PORT}`]);
+      let stdout = "", stderr = "";
+      child.stdout.on("data", (d) => { stdout += d; });
+      child.stderr.on("data", (d) => { stderr += d; });
+      child.on("error", reject);
+      child.on("close", () => {
+        try { resolve(JSON.parse(stdout)); }
+        catch (e) { reject(new Error(`state authority: empty/bad response (${stderr.trim() || e.message})`)); }
       });
-      return JSON.parse(stdout);
-    },
+      try { child.stdin.write(JSON.stringify({ method, args })); child.stdin.end(); }
+      catch (e) { reject(e); }
+    }),
     // policyStore: the ordered signed policy_envelopes chain for a link.
     policyStore: async (linkId) => {
       const rows = await db.from("policy_envelopes").select("version,action,core,core_hash,sigs").eq("link_id", linkId).order("version", { ascending: true });
