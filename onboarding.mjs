@@ -152,7 +152,30 @@ export class OnboardingManager {
     // already durable, so leaving it stranded would orphan a live auth key and wedge
     // the phone. Mirrors authorize's self-teardown.
     try {
-      const res = await this._fx.sendCode({ link: c.link, phone: c.phone });
+      let res;
+      try {
+        res = await this._fx.sendCode({ link: c.link, phone: c.phone });
+      } catch (e) {
+        const migration = /^(?:PHONE|NETWORK|USER)_MIGRATE_(\d+)$/.exec(e.message);
+        if (!migration) throw e;
+        const dcId = Number(migration[1]);
+        if (!Number.isInteger(dcId) || dcId < 1 || dcId > 5) throw e;
+
+        // The source-DC SendCode was refused, so no login side effect occurred.
+        // Cold-switch to the requested DC, then durably rotate RECOVERY to the
+        // freshly minted target-DC auth key BEFORE retrying SendCode once.
+        await this._fx.migrateOnboardingDc({ link: c.link, dcId });
+        const rotated = await this._fx.rotateRecovery({
+          link: c.link,
+          state: c.state,
+          expectedRecoveryDigest: c.recoveryDigest,
+          expectedGeneration: c.recoveryGen,
+          signersCommit: c.signerGenesis.commit,
+        });
+        c.recoveryGen += 1;
+        c.recoveryDigest = rotated.envelopeDigest;
+        res = await this._fx.sendCode({ link: c.link, phone: c.phone });
+      }
       c.phoneCodeHash = res.phoneCodeHash;
       c.status = STATES.CODE_SENT;
       c.stepAt = this._fx.now();
@@ -228,6 +251,9 @@ export class OnboardingManager {
     // from the console after arming. listSessions is read-only (getAuthorizations).
     let sessions = null;
     try { sessions = (await this._fx.listSessions?.({ link: c.link })) ?? null; } catch { sessions = null; }
+    if (sessions) {
+      try { await this._fx.publishSessions?.({ link: c.link, sessions }); } catch { /* sealed login remains valid */ }
+    }
     await this._fx.disconnect?.(c);
     this._sessions.delete(c.onb);
     return { done: true, tgUserId: c.tgUserId, firstName: me.firstName, username: me.username, sessions };

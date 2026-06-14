@@ -152,19 +152,21 @@ export function makeArmCompleter({
     //    lease holder may; idempotent if already armed with the same genesis).
     const lease = await authorityClient.acquireLease(state, holder, ARM_LEASE_TTL_MS);
     const epoch = lease.record.lease_epoch;
-    await authorityClient.promoteToArmed(state, holder, epoch, 1, genesisHash);
+    try {
+      await authorityClient.promoteToArmed(state, holder, epoch, 1, genesisHash);
 
-    // 7. Atomically commit the new seal + commit + status='armed' (gateway-only fn,
-    //    CAS on the expected old generation so a concurrent writer cannot clobber).
-    await db.rpc("gateway_complete_arm", {
-      p_link: link, p_state_id: state,
-      p_expected_generation: Number(row.seal_generation), p_new_generation: newGen,
-      p_encrypted_data_key: encryptedDataKey, p_nonce: env.nonce, p_ciphertext: env.ciphertext, p_tag: env.tag,
-      p_context_id: contextId, p_signers_commit: expectedCommit, p_envelope_digest: digest,
-    });
-
-    // 8. release the arm lease so the adopt loop re-acquires cleanly.
-    try { await authorityClient.releaseLease(state, holder, epoch); } catch { /* terminal/renewed elsewhere */ }
+      // 7. Atomically commit the new seal + commit + status='armed' (gateway-only
+      //    fn, CAS on the expected old generation).
+      await db.rpc("gateway_complete_arm", {
+        p_link: link, p_state_id: state,
+        p_expected_generation: Number(row.seal_generation), p_new_generation: newGen,
+        p_encrypted_data_key: encryptedDataKey, p_nonce: env.nonce, p_ciphertext: env.ciphertext, p_tag: env.tag,
+        p_context_id: contextId, p_signers_commit: expectedCommit, p_envelope_digest: digest,
+      });
+    } finally {
+      // Never strand the arm lease after a DB or State Authority failure.
+      try { await authorityClient.releaseLease(state, holder, epoch); } catch { /* terminal/renewed elsewhere */ }
+    }
 
     return { armed: true, link, genesisHash, newGeneration: newGen, signersCommit: expectedCommit };
   }
@@ -184,15 +186,19 @@ export function makeArmCompleter({
       return { completed: 0, failed: 0, skipped: 0, error: e?.message };
     }
     let completed = 0, failed = 0, skipped = 0;
+    const failures = [];
     for (const row of rows) {
       let genesis;
       try { genesis = await loadGenesis(String(row.id)); }
       catch { genesis = null; }
       if (!genesis) { skipped += 1; continue; } // no arm requested yet
       try { await completeArm({ row }); completed += 1; }
-      catch { failed += 1; }
+      catch (e) {
+        failed += 1;
+        failures.push({ link: String(row.id), error: e?.message ?? String(e) });
+      }
     }
-    return { completed, failed, skipped };
+    return { completed, failed, skipped, failures };
   }
 
   return { completeArm, sweepPendingArms, _loadGenesis: loadGenesis, _loadRegisteredSigners: loadRegisteredSigners };

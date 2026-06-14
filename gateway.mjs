@@ -20,6 +20,61 @@ import { deriveAuthority, assertOpAllowed } from "./policy-verify.mjs";
 import { decodeRequest, encodeResponse, encodeEvent } from "./brain-protocol.mjs";
 import { Brain } from "./brain.mjs";
 
+// FLOOD_WAIT detection. GramJS rewrites FloodWaitError's `.message` to a human
+// sentence ("A wait of N seconds is required ...") but keeps the wait on
+// `.seconds`; the chokepoint may also surface the canonical FLOOD_WAIT_N code.
+// Match all three so a rate-limited account backs off for exactly as long as
+// Telegram demands instead of hammering and extending the penalty.
+function floodWaitSeconds(e) {
+  if (!e) return null;
+  if (typeof e.seconds === "number" && e.seconds >= 0) return e.seconds;
+  const msg = String(e.errorMessage ?? e.message ?? "");
+  const m = /FLOOD_WAIT_(\d+)|A wait of (\d+) seconds/i.exec(msg);
+  return m ? Number(m[1] ?? m[2]) : null;
+}
+
+// Ops that actually touch Telegram (WHO_AM_I answers from cached identity, so it
+// is excluded). These are the ops a FLOOD_WAIT backoff must suppress.
+const MTPROTO_OPS = new Set(["LIST_SESSIONS", "READ_SECURITY_STATE", "EVICT_SESSION", "DECLINE_RESET", "LOGOUT_SELF"]);
+
+// Stable signature of the LIVE roster. Includes every security-relevant and
+// display-identity field (IP, country, device, app, unconfirmed) so a session
+// that moves or appears unconfirmed republishes. Only the high-churn timestamps
+// (dateActive/dateCreated) are excluded — those advance constantly and would
+// defeat the dedup; the dashboard recomputes "X ago" client-side regardless.
+function rosterSignature(sessions) {
+  if (!Array.isArray(sessions)) return "";
+  return sessions
+    .map((s) => [
+      s.hash, s.current ? 1 : 0, s.unconfirmed ? 1 : 0,
+      s.ip ?? "", s.country ?? "", s.region ?? "",
+      s.deviceModel ?? "", s.platform ?? "", s.systemVersion ?? "", s.appName ?? "",
+    ].join(""))
+    .sort()
+    .join("|");
+}
+
+// Human-readable reason strings for the typed activity-feed events the gateway
+// records. Kinds match lib/activity-events.tsx (the dashboard contract).
+const EVENT_REASON = {
+  login_new: "New Telegram login detected",
+  device_evicted: "Removed a session that was not on the signed keep-list",
+  session_terminated_elsewhere: "A session was signed out elsewhere",
+  session_location_changed: "A session changed location",
+  twofa_enabled: "Two-step verification was turned on",
+  twofa_disabled: "Two-step verification was turned off",
+  reset_requested: "A 2FA-password reset was requested",
+  reset_blocked: "A pending 2FA-password reset was declined",
+  reset_cancelled: "A pending 2FA-password reset was cancelled",
+  recovery_set: "A 2FA recovery email was set",
+  login_email_set: "A login email was set",
+  account_ttl_changed: "The account self-destruct timer changed",
+  session_ttl_changed: "The session auto-terminate timer changed",
+  account_frozen: "Telegram froze the account",
+  eviction_rate_capped: "Multiple unauthorized sessions are being removed in batches",
+  guard_connected: "Your Sessions guard connected",
+};
+
 export class Gateway {
   // deps:
   //   kms              : { generateDataKey, decryptDataKey } (kms-envelope-v3 transport)
@@ -37,6 +92,8 @@ export class Gateway {
     this._byState = new Map(); // state_id -> acctHandle
   }
 
+  _clock() { return (this._d.now ?? (() => Date.now()))(); }
+
   // Adopt an armed link: acquire the lease, KMS-open the v3 FINAL envelope under
   // the exact context, run binding-1/2, derive authority, and start serving.
   async adopt(row, holder, leaseTtlMs) {
@@ -50,63 +107,80 @@ export class Gateway {
     const gen = lease.record.lease_epoch;
 
     // 2. KMS-open the FINAL envelope; binding-1 byte-compares inner vs row.
-    const dataKey = await this._d.kms.decryptDataKey({ encryptedDataKey: row.seal_encrypted_data_key, contextId: row.kms_context_id, creds: await this._d.freshCreds() });
-    let opened;
+    let tx = null;
     try {
-      opened = openEnvelopeV3({
-        dataKey,
-        nonce: row.seal_nonce, ciphertext: row.seal_ciphertext, tag: row.seal_tag,
-        expected: {
-          sealPhase: "FINAL", sealGeneration: row.seal_generation,
-          linkId: row.id, tgUserId: row.tg_user_id, stateId: row.state_id,
-          kmsContextId: row.kms_context_id, signersCommit: row.signers_commit,
-        },
+      const dataKey = await this._d.kms.decryptDataKey({ encryptedDataKey: row.seal_encrypted_data_key, contextId: row.kms_context_id, creds: await this._d.freshCreds() });
+      let opened;
+      try {
+        opened = openEnvelopeV3({
+          dataKey,
+          nonce: row.seal_nonce, ciphertext: row.seal_ciphertext, tag: row.seal_tag,
+          expected: {
+            sealPhase: "FINAL", sealGeneration: row.seal_generation,
+            linkId: row.id, tgUserId: row.tg_user_id, stateId: row.state_id,
+            kmsContextId: row.kms_context_id, signersCommit: row.signers_commit,
+          },
+        });
+      } finally {
+        dataKey.fill(0);
+      }
+
+      // 3. Build the audited armed transport and connect; binding-2 = whoAmI.
+      const handle = `acct-${row.state_id}`;
+      // onReconnect: after the connection drops and re-establishes, immediately
+      // sweep this account to catch any login that happened during the gap (we do
+      // not track pts/getDifference, so a pushed UpdateNewAuthorization in the
+      // window would otherwise only surface on the next periodic poll).
+      tx = await transportFactory({
+        mode: MODES.ARMED,
+        session: opened.session,
+        onNewAuth: (evt) => this._onNewAuth(handle, evt),
+        onReconnect: () => { this.sweepAccount(handle).catch(() => {}); },
       });
-    } finally {
-      dataKey.fill(0);
-    }
+      opened.session = null;
+      await tx.connect();
+      const me = await tx.whoAmI();
+      if (String(me.tgUserId) !== String(row.tg_user_id)) {
+        throw new Error("adopt: binding-2 identity mismatch");
+      }
 
-    // 3. Build the audited armed transport and connect; binding-2 = whoAmI.
-    //    The connection (connection.mjs) owns the chokepoint and installs the
-    //    audited serialization; the gateway consumes the transport it returns.
-    //    The transport's typed NEW_AUTH event drives the in-process detection.
-    const handle = `acct-${row.state_id}`;
-    const tx = await transportFactory({ mode: MODES.ARMED, session: opened.session, onNewAuth: (evt) => this._onNewAuth(handle, evt) });
-    await tx.connect();
-    const me = await tx.whoAmI();
-    if (String(me.tgUserId) !== String(row.tg_user_id)) {
-      await tx.disconnect();
-      throw new Error("adopt: binding-2 identity mismatch");
-    }
+      // 4. Derive authority from the signed chain anchored at the State Authority head.
+      const rows = await policyStore(row.id);
+      const derived = await deriveAuthority(rows, {
+        linkId: row.id, tgUserId: row.tg_user_id, signersCommit: row.signers_commit,
+        now: this._d.now ?? (() => Date.now()), ...verifierCfg,
+      }, { version: rec.policy_version, hash: rec.policy_head_hash });
+      if (!derived.ok) throw new Error(`adopt: policy authority rejected: ${derived.reason}`);
 
-    // 4. Derive authority from the signed chain anchored at the State Authority head.
-    const rows = await policyStore(row.id);
-    const derived = await deriveAuthority(rows, {
-      linkId: row.id, tgUserId: row.tg_user_id, signersCommit: row.signers_commit,
-      now: this._d.now ?? (() => Date.now()), ...verifierCfg,
-    }, { version: rec.policy_version, hash: rec.policy_head_hash });
-    if (!derived.ok) {
-      await tx.disconnect();
-      throw new Error(`adopt: policy authority rejected: ${derived.reason}`);
+      const parsedFreshUntil = row.fresh_until ? Date.parse(row.fresh_until) : NaN;
+      const ctx = {
+        handle, stateId: row.state_id, linkId: row.id, tgUserId: String(row.tg_user_id),
+        gen, holder, leaseDeadline: lease.localDeadline, tx, authority: derived.authority,
+        freshUntil: Number.isFinite(parsedFreshUntil) ? parsedFreshUntil : null,
+        opChain: Promise.resolve(), // serializes all MTProto work for this account
+        floodUntil: null,      // set when Telegram rate-limits; suppresses MTProto until it elapses
+        lastPublishSig: null,  // last roster signature published; skips redundant snapshot rewrites
+        security: null,        // last published security-notes view (has_2fa, reset_pending, ttls, frozen)
+        lastRoster: null,      // previous live roster, for session_terminated_elsewhere / location_changed diff
+        massEvictUntil: null,  // per-burst dedup window for eviction_rate_capped
+        renewFail: 0,          // consecutive lease-renewal failures (C6: tolerate transients before fencing)
+        frozenUntil: null,     // backoff while the account is frozen (account_frozen)
+        frozenAlerted: false,  // one-shot guard for the account_frozen event
+      };
+      this._accts.set(handle, ctx);
+      this._byState.set(row.state_id, handle);
+      ctx.brain = new Brain({
+        gateway: { call: (op, arg) => this._call(handle, op, arg) },
+        policyView: async () => this._buildPolicyView(handle),
+        now: this._d.now ?? (() => Date.now()),
+        log: this._d.logger ?? (() => {}),
+      });
+      return { handle, gen };
+    } catch (e) {
+      if (tx) { try { await tx.disconnect(); } catch { /* failed adoption */ } }
+      try { await authorityClient.releaseLease(row.state_id, holder, gen); } catch { /* lease expires if release is unavailable */ }
+      throw e;
     }
-
-    const ctx = {
-      handle, stateId: row.state_id, linkId: row.id, tgUserId: String(row.tg_user_id),
-      gen, holder, leaseDeadline: lease.localDeadline, tx, authority: derived.authority, freshUntil: null,
-    };
-    this._accts.set(handle, ctx);
-    this._byState.set(row.state_id, handle);
-    // Fold-in detection (Option A): the gateway runs the open detection IN-PROCESS.
-    // It can only call the same chokepoint verbs as any gateway code, and its
-    // policy view is the AUTHORITATIVE derived policy (not a separate store), so
-    // the gateway remains the ceiling on everything detection proposes.
-    ctx.brain = new Brain({
-      gateway: { call: (op, arg) => this._call(handle, op, arg) },
-      policyView: async () => this._buildPolicyView(handle),
-      now: this._d.now ?? (() => Date.now()),
-      log: this._d.logger ?? (() => {}),
-    });
-    return { handle, gen };
   }
 
   _ctx(acct, gen) {
@@ -170,7 +244,24 @@ export class Gateway {
   // bounds, so detection can do nothing a remote brain could not.
   async _call(handle, op, arg) {
     const ctx = this._ctx(handle);
-    return this._dispatch(ctx, { op, arg });
+    // Flood backoff is enforced HERE, at the single in-process chokepoint every
+    // MTProto op crosses — not in the brain (which swallows EVICT/DECLINE errors,
+    // so a FLOOD_WAIT from those never reaches a caller) and not in sweepAccount.
+    // While rate-limited, refuse MTProto ops without touching Telegram; the brain's
+    // per-op try/catch logs and moves on, producing zero traffic during the wait.
+    if (MTPROTO_OPS.has(op) && ctx.floodUntil && this._clock() < ctx.floodUntil) {
+      throw new Error("flood-backoff");
+    }
+    try {
+      return await this._dispatch(ctx, { op, arg });
+    } catch (e) {
+      const wait = floodWaitSeconds(e);
+      if (wait != null) {
+        ctx.floodUntil = this._clock() + wait * 1000;
+        this._d.logger?.(`[${handle}] flood-wait ${wait}s — backing off MTProto`);
+      }
+      throw e;
+    }
   }
 
   // The policy view detection plans against, built from the AUTHORITATIVE derived
@@ -189,16 +280,133 @@ export class Gateway {
   // React to a typed NEW_AUTH event in-process: an immediate protective sweep.
   async _onNewAuth(handle, evt) {
     const ctx = this._accts.get(handle);
-    if (!ctx?.brain) return;
-    try { await ctx.brain.onNewAuth(handle, evt); }
-    catch { /* detection is best-effort; the chokepoint bounds the blast radius */ }
+    if (!ctx) return; // no account context at all -> nothing to attribute the event to
+    // Record the login UNCONDITIONALLY (only ctx presence required) -- the old
+    // worker logged first, protected second. Gating the record on brain-readiness
+    // dropped a push that arrived in the adoption window (C1).
+    try {
+      await this._d.recordEvent?.({
+        linkId: ctx.linkId,
+        kind: "login_new",
+        reason: EVENT_REASON.login_new,
+        detail: {
+          hash: evt.hash, unconfirmed: !!evt.unconfirmed,
+          device: evt.device ?? null, location: evt.location ?? null,
+        },
+      });
+    } catch (e) {
+      this._d.logger?.(`event publish failed for ${ctx.linkId}: ${e.message}`);
+    }
+    // Protective sweep only once the brain is up (detection is best-effort).
+    if (ctx.brain) {
+      try { await this.sweepAccount(handle); }
+      catch { /* the chokepoint bounds the blast radius */ }
+    }
+  }
+
+  // Serialize all MTProto work for one account onto a single chain so a periodic
+  // sweep, a NEW_AUTH-driven sweep, and the reset-protection check never issue
+  // concurrent calls on the same connection.
+  _runSerial(ctx, fn) {
+    const next = ctx.opChain.then(fn, fn);
+    ctx.opChain = next.catch(() => {});
+    return next;
   }
 
   // One protective sweep for an adopted account (poll-driven by gateway-main).
   async sweepAccount(handle) {
     const ctx = this._accts.get(handle);
     if (!ctx?.brain) return null;
-    return ctx.brain.sweep(handle);
+    const run = async () => {
+      // While rate-limited, do not touch MTProto at all (the backoff is set in
+      // _call). Hammering during a FLOOD_WAIT only extends the penalty. We also do
+      // NOT stamp last_poll here: the dashboard already explains a stale poll during
+      // a Telegram freeze as "healing on its own," which is the honest signal.
+      if (ctx.floodUntil && this._clock() < ctx.floodUntil) {
+        return { listed: 0, proposed: 0, removed: 0, skipped: "flood-backoff", sessions: [], evicted: [] };
+      }
+      let result;
+      try {
+        result = await ctx.brain.sweep(handle);
+      } catch (e) {
+        // _call already recorded the backoff window for a flood; treat it as a skip.
+        if (ctx.floodUntil && this._clock() < ctx.floodUntil) {
+          return { listed: 0, proposed: 0, removed: 0, skipped: "flood-backoff", sessions: [], evicted: [] };
+        }
+        throw e;
+      }
+      // A LIST may have succeeded but an EVICT may have raised FLOOD_WAIT inside
+      // Brain.sweep's per-candidate catch. _call records that wait centrally; do
+      // not clear it merely because the brain returned a summary.
+      if (ctx.floodUntil && this._clock() < ctx.floodUntil) {
+        return { ...result, skipped: "flood-backoff" };
+      }
+      ctx.floodUntil = null; // clear only an expired/stale prior backoff
+      // Post-eviction roster = the listed roster minus what we just removed.
+      const evictedHashes = new Set((result.evicted ?? []).map((e) => String(e.hash)));
+      const sessions = evictedHashes.size > 0
+        ? (result.sessions ?? []).filter((s) => !evictedHashes.has(String(s.hash)))
+        : (result.sessions ?? []);
+
+      // ── activity events (collected, then recorded OUTSIDE the publish try/catch) ──
+      const events = [];
+
+      // Roster diff (C3): the user removing a session elsewhere, or a session moving.
+      // Seed on the first sweep (no events for a pre-existing roster); evictions are
+      // attributed to device_evicted below, not double-counted as "terminated".
+      if (ctx.lastRoster) {
+        const curByHash = new Map(sessions.map((s) => [String(s.hash), s]));
+        const prevByHash = new Map(ctx.lastRoster.map((s) => [String(s.hash), s]));
+        for (const [hash, p] of prevByHash) {
+          if (!curByHash.has(hash) && !evictedHashes.has(hash)) {
+            events.push({ kind: "session_terminated_elsewhere", hash, deviceModel: p.deviceModel ?? null, country: p.country ?? null, detail: { device: p.deviceModel ?? p.appName ?? null, country: p.country ?? null } });
+          }
+        }
+        for (const [hash, cu] of curByHash) {
+          const p = prevByHash.get(hash);
+          if (p && (String(cu.country ?? "") !== String(p.country ?? "") || String(cu.region ?? "") !== String(p.region ?? ""))) {
+            // Dashboard renders detail.device + detail.country (the NEW location).
+            events.push({ kind: "session_location_changed", hash, deviceModel: cu.deviceModel ?? null, country: cu.country ?? null, detail: { device: cu.deviceModel ?? cu.appName ?? null, country: cu.country ?? null, from: p.country ?? null } });
+          }
+        }
+      }
+      ctx.lastRoster = sessions;
+
+      // device_evicted (one per removed session).
+      for (const row of result.evicted ?? []) {
+        events.push({ kind: "device_evicted", hash: String(row.hash), deviceModel: row.deviceModel ?? null, ip: row.ip ?? null, country: row.country ?? null, detail: { device: row.deviceModel ?? row.appName ?? null, country: row.country ?? null } });
+      }
+
+      // eviction_rate_capped (H4): the brain capped a mass-eviction; alert once/burst.
+      if ((result.pending ?? 0) > 0 && (!ctx.massEvictUntil || this._clock() >= ctx.massEvictUntil)) {
+        ctx.massEvictUntil = this._clock() + 3600000;
+        events.push({ kind: "eviction_rate_capped", detail: { total: (result.pending ?? 0) + (result.removed ?? 0), perSweep: 3 } });
+      } else if ((result.pending ?? 0) === 0) {
+        ctx.massEvictUntil = null;
+      }
+
+      // Stamp liveness on EVERY successful sweep (dashboard gates PROTECTED on a
+      // fresh last_poll). Ship the full roster only when it changed, and ALWAYS
+      // include the security notes view so a roster-only publish never clobbers the
+      // 2FA/reset/recovery/TTL state the 5-min check maintains.
+      const sig = rosterSignature(sessions);
+      const rosterChanged = sessions.length > 0 && (result.removed > 0 || sig !== ctx.lastPublishSig);
+      try {
+        await this._d.publishState?.({ linkId: ctx.linkId, sessions: rosterChanged ? sessions : null, status: "active", notes: { ...(ctx.security ?? {}) } });
+        if (rosterChanged) ctx.lastPublishSig = sig;
+      } catch (e) {
+        this._d.logger?.(`state publish failed for ${ctx.linkId}: ${e.message}`);
+      }
+      // Record events independently of the publish (H1): a publish failure or one
+      // bad event must not swallow the rest of the audit trail.
+      for (const ev of events) {
+        try {
+          await this._d.recordEvent?.({ linkId: ctx.linkId, kind: ev.kind, reason: EVENT_REASON[ev.kind] ?? ev.kind, hash: ev.hash ?? null, deviceModel: ev.deviceModel ?? null, ip: ev.ip ?? null, country: ev.country ?? null, detail: ev.detail ?? {} });
+        } catch (e) { this._d.logger?.(`event ${ev.kind} record failed for ${ctx.linkId}: ${e.message}`); }
+      }
+      return result;
+    };
+    return this._runSerial(ctx, run);
   }
 
   // Periodic poll: sweep + reset-protection check across every adopted account.
@@ -214,7 +422,49 @@ export class Gateway {
   async checkSecurityAll() {
     for (const handle of [...this._accts.keys()]) {
       const ctx = this._accts.get(handle);
-      if (ctx?.brain) { try { await ctx.brain.checkSecurity(handle); } catch { /* best-effort */ } }
+      if (!ctx?.brain) continue;
+      if (ctx.floodUntil && this._clock() < ctx.floodUntil) continue; // respect the active backoff
+      // Serialize onto the same per-account chain as sweeps: the 60s/5min timers
+      // coincide, and two concurrent MTProto calls on one connection race.
+      if (ctx.frozenUntil && this._clock() < ctx.frozenUntil) continue; // skip a frozen account's poll
+      await this._runSerial(ctx, async () => {
+        let result;
+        try { result = await ctx.brain.checkSecurity(handle); }
+        catch (e) {
+          // account_frozen (C4): Telegram froze the account (FROZEN_METHOD_INVALID).
+          // Record once + 1h backoff, distinct from FLOOD_WAIT.
+          if (/FROZEN_METHOD_INVALID/i.test(String(e?.message))) {
+            ctx.frozenUntil = this._clock() + 3600000;
+            if (!ctx.frozenAlerted) {
+              ctx.frozenAlerted = true;
+              ctx.security = { ...(ctx.security ?? {}), frozen: true };
+              try { await this._d.recordEvent?.({ linkId: ctx.linkId, kind: "account_frozen", reason: EVENT_REASON.account_frozen, detail: {} }); } catch { /* best-effort */ }
+              try { await this._d.publishState?.({ linkId: ctx.linkId, sessions: null, status: "active", notes: { ...(ctx.security ?? {}) } }); } catch { /* best-effort */ }
+            }
+            return;
+          }
+          // _call sets the backoff window on a flood; otherwise it is best-effort.
+          if (!(ctx.floodUntil && this._clock() < ctx.floodUntil)) {
+            this._d.logger?.(`[${handle}] security check failed: ${e.message}`);
+          }
+          return;
+        }
+        ctx.frozenAlerted = false; // a successful read clears any prior frozen flag
+        // Update the published security-notes view the dashboard reads.
+        const s = result.security;
+        ctx.security = {
+          has_2fa: s.hasPwd, has_recovery: s.hasRecovery, reset_pending: s.pendingReset,
+          account_ttl_days: s.accountTtlDays, session_ttl_days: s.sessionTtlDays, frozen: false,
+        };
+        // Record the typed change events (twofa/reset/recovery/login-email/ttl).
+        for (const ev of result.events ?? []) {
+          try { await this._d.recordEvent?.({ linkId: ctx.linkId, kind: ev.kind, reason: EVENT_REASON[ev.kind] ?? ev.kind, detail: ev.detail ?? {} }); }
+          catch (e) { this._d.logger?.(`event ${ev.kind} record failed for ${ctx.linkId}: ${e.message}`); }
+        }
+        // Publish the security state into guard_state.notes (full view, never {}).
+        try { await this._d.publishState?.({ linkId: ctx.linkId, sessions: null, status: "active", notes: { ...ctx.security } }); }
+        catch (e) { this._d.logger?.(`security publish failed for ${ctx.linkId}: ${e.message}`); }
+      }).catch(() => {});
     }
   }
 
@@ -226,6 +476,11 @@ export class Gateway {
   // Count of currently-served accounts (boot/health observability).
   adoptedCount() { return this._accts.size; }
 
+  // Is this state_id currently adopted/served? Lets the periodic re-adopt loop
+  // skip links already guarded and pick up any that aren't (post-restart lease
+  // race, a self-fenced account, or a newly-armed link).
+  isAdopted(stateId) { return this._byState.has(stateId); }
+
   // Lease watchdog: renew every adopted account's lease before it expires and
   // refresh its conservative local deadline. A failed renewal self-fences that
   // account (5.5): only one unexpired holder may ever serve.
@@ -234,8 +489,15 @@ export class Gateway {
       try {
         const { localDeadline } = await this._d.authorityClient.renewLease(ctx.stateId, ctx.holder, ctx.gen, ttlMs);
         ctx.leaseDeadline = localDeadline;
+        ctx.renewFail = 0;
       } catch (e) {
-        await this.selfFence(handle, `lease renewal failed: ${e.message}`);
+        // C6: tolerate a transient State-Authority blip. Renewal runs every 20s and
+        // the local lease deadline (~60s, enforced in _ctx) is the hard self-fence
+        // backstop -- so ONE failed renewal must not drop a healthy guard to DOWN
+        // (the flapping bug). Fence only after 3 consecutive failures (~60s ≈ TTL).
+        ctx.renewFail = (ctx.renewFail ?? 0) + 1;
+        if (ctx.renewFail >= 3) await this.selfFence(handle, `lease renewal failed: ${e.message}`);
+        else this._d.logger?.(`[${handle}] lease renewal transient failure ${ctx.renewFail}/3: ${e.message}`);
       }
     }
   }
@@ -248,5 +510,8 @@ export class Gateway {
     this._accts.delete(acct);
     this._byState.delete(ctx.stateId);
     try { await ctx.tx.disconnect(); } catch { /* already down */ }
+    try {
+      await this._d.publishState?.({ linkId: ctx.linkId, sessions: null, status: "down", notes: { reason } });
+    } catch { /* the off-box heartbeat also detects an unavailable gateway */ }
   }
 }

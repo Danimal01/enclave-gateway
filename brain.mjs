@@ -38,6 +38,10 @@ export class Brain {
     this._p = { ...DEFAULTS, ...params };
     this._now = now;
     this._log = log;
+    // Prior security snapshot for change-detection (twofa/recovery/login-email/
+    // reset/ttl). Null until the first read; the first read SEEDS only (no events)
+    // so we never emit a spurious "changed" for state that predates the guard.
+    this._lastSec = null;
   }
 
   // One protective sweep for an account handle. Returns a summary of what it
@@ -49,7 +53,7 @@ export class Brain {
     // a void wastes calls and would misreport "removing N".
     if (!view || !view.whitelist) {
       this._log(`[${acct}] no policy view — watch-only sweep`);
-      return { listed: 0, proposed: 0, removed: 0, skipped: "no-policy-view" };
+      return { listed: 0, proposed: 0, removed: 0, skipped: "no-policy-view", sessions: [], evicted: [] };
     }
 
     const { sessions } = await this._gw.call("LIST_SESSIONS", {});
@@ -65,17 +69,21 @@ export class Brain {
 
     if (fresh) {
       this._log(`[${acct}] fresh window active — proposing no evictions`);
-      return { listed: sessions.length, proposed: 0, removed: 0, skipped: "fresh-window", pending: candidates.length };
+      return { listed: sessions.length, proposed: 0, removed: 0, skipped: "fresh-window", pending: candidates.length, sessions, evicted: [] };
     }
 
     // Rate cap: never fire a thundering mass-eviction in one sweep; whittle a
     // flood down over successive sweeps.
     const batch = candidates.slice(0, this._p.MAX_EVICT_PER_SWEEP);
     let removed = 0;
+    const evicted = [];
     for (const s of batch) {
       try {
         const body = await this._gw.call("EVICT_SESSION", { hash: String(s.hash), authorized: view.authToken });
-        if (body.removed) removed += 1;
+        if (body.removed) {
+          removed += 1;
+          evicted.push(s);
+        }
       } catch (e) {
         // The gateway refused (e.g. the session was on the signed whitelist after
         // all, or became current). The detection proposing is not authority; a
@@ -83,7 +91,10 @@ export class Brain {
         this._log(`[${acct}] evict ${s.hash} refused by gateway: ${e.message}`);
       }
     }
-    return { listed: sessions.length, proposed: batch.length, removed, pending: Math.max(0, candidates.length - batch.length) };
+    return {
+      listed: sessions.length, proposed: batch.length, removed,
+      pending: Math.max(0, candidates.length - batch.length), sessions, evicted,
+    };
   }
 
   // Reset-protection: while a 2FA-password reset is pending and the signed policy
@@ -91,16 +102,50 @@ export class Brain {
   async checkSecurity(acct) {
     const view = await this._policyView(acct);
     const sec = await this._gw.call("READ_SECURITY_STATE", {});
-    if (sec.pendingReset && view?.resetProtection) {
-      try {
-        const body = await this._gw.call("DECLINE_RESET", { authorized: view.authToken });
-        return { declined: !!body.declined, pendingReset: true };
-      } catch (e) {
-        this._log(`[${acct}] decline-reset refused: ${e.message}`);
-        return { declined: false, pendingReset: true, refused: e.message };
-      }
+    const cur = {
+      hasPwd: !!sec.hasPwd, hasRecovery: !!sec.hasRecovery,
+      pendingReset: !!sec.pendingReset, pendingResetAt: sec.pendingResetAt ?? null,
+      loginEmail: sec.loginEmailPattern ?? null,
+      accountTtlDays: sec.accountTtlDays ?? null, sessionTtlDays: sec.sessionTtlDays ?? null,
+    };
+
+    // ACTION (authority-bounded): decline a pending reset while protected.
+    let declined = false;
+    if (cur.pendingReset && view?.resetProtection) {
+      try { const body = await this._gw.call("DECLINE_RESET", { authorized: view.authToken }); declined = !!body.declined; }
+      catch (e) { this._log(`[${acct}] decline-reset refused: ${e.message}`); }
     }
-    return { declined: false, pendingReset: !!sec.pendingReset };
+
+    // OBSERVABILITY: diff against the prior snapshot and emit typed change events
+    // (the gateway records them; the brain holds no DB authority). Seed-only on the
+    // first read so we never fire a spurious change for pre-existing state.
+    const events = [];
+    const prev = this._lastSec;
+    if (prev) {
+      if (cur.pendingReset && !prev.pendingReset) {
+        if (declined) {
+          events.push({ kind: "reset_blocked", detail: {} });
+        } else {
+          // The dashboard renders detail.until (a human string), e.g. "in 7 days".
+          const days = cur.pendingResetAt ? Math.max(0, Math.round((cur.pendingResetAt * 1000 - this._now()) / 86400000)) : null;
+          events.push({ kind: "reset_requested", detail: days != null ? { until: `in ${days} day${days === 1 ? "" : "s"}` } : {} });
+        }
+      } else if (!cur.pendingReset && prev.pendingReset) {
+        events.push({ kind: "reset_cancelled", detail: {} });
+      } else if (declined) {
+        events.push({ kind: "reset_blocked", detail: {} });
+      }
+      if (cur.hasPwd && !prev.hasPwd) events.push({ kind: "twofa_enabled", detail: {} });
+      if (!cur.hasPwd && prev.hasPwd) events.push({ kind: "twofa_disabled", detail: {} });
+      if (cur.hasRecovery && !prev.hasRecovery) events.push({ kind: "recovery_set", detail: {} });
+      if (cur.loginEmail && cur.loginEmail !== prev.loginEmail) events.push({ kind: "login_email_set", detail: { pattern: cur.loginEmail } });
+      if (cur.accountTtlDays && prev.accountTtlDays && cur.accountTtlDays !== prev.accountTtlDays) events.push({ kind: "account_ttl_changed", detail: { days: cur.accountTtlDays } });
+      if (cur.sessionTtlDays && prev.sessionTtlDays && cur.sessionTtlDays !== prev.sessionTtlDays) events.push({ kind: "session_ttl_changed", detail: { days: cur.sessionTtlDays } });
+    } else if (declined) {
+      events.push({ kind: "reset_blocked", detail: {} });
+    }
+    this._lastSec = cur;
+    return { declined, pendingReset: cur.pendingReset, events, security: cur };
   }
 
   // React to the typed NEW_AUTH event the gateway surfaces (four fields, no

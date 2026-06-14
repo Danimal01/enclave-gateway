@@ -63,7 +63,15 @@ COPY libnsm.so /usr/lib64/libnsm.so
 COPY gvforwarder /usr/local/bin/gvforwarder
 COPY --from=builder /attest /attest
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /usr/bin/kmstool_enclave_cli /usr/local/bin/gvforwarder /attest /entrypoint.sh
+# Canonicalize permissions of every COPYed file. COPY preserves the host's mode
+# bits, which depend on the BUILDER'S UMASK (e.g. 644 under umask 022 vs 664 under
+# 002) -- so without this the measured PCR0 varies by who builds it and the
+# "rebuild this and get the same PCR0" claim fails for anyone whose umask differs.
+# Pin every COPYed path to a fixed mode so a rebuild reproduces the same PCR0
+# regardless of umask. (node_modules is built in-image by npm ci under the fixed
+# container umask, so it is already deterministic and left untouched.)
+RUN chmod 644 /app/*.mjs /app/supabase-ca.pem /usr/lib64/libnsm.so \
+ && chmod 755 /usr/bin/kmstool_enclave_cli /usr/local/bin/gvforwarder /attest /entrypoint.sh
 # Determinism: drop install-timestamped state, pin every mtime to a fixed epoch.
 RUN rm -rf /var/lib/rpm /var/lib/dnf /var/cache /var/log /var/tmp/* /root/.npm /tmp/* 2>/dev/null; mkdir -p /tmp; : > /etc/machine-id 2>/dev/null || true; \
     find / -xdev -not -path '/proc/*' -not -path '/sys/*' -not -path '/dev/*' -print0 | xargs -0 touch -h -d @1577836800; true

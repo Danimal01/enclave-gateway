@@ -16,10 +16,8 @@
 //     sealEnvelopeV3 can seal it. It is never returned over the channel or to the DB.
 //
 // Telegram RPC error strings are mapped to the EXACT messages the OnboardingManager
-// branches on. Pre-sign-in DC migration (PHONE_MIGRATE_x) is detected and raised as
-// a distinct, loud error rather than silently mishandled: handling it correctly
-// needs a cold-reconnect-to-DC path (new auth key) plus a recovery-envelope
-// rotation, which is a separate, tested change (see docs/onboarding-integration-plan.md).
+// branches on. Pre-sign-in DC migration remains explicit so the manager can cold
+// switch, rotate the durable recovery envelope, and only then retry sendCode.
 
 import { Api } from "telegram";
 import { MODES } from "./tg-chokepoint.mjs";
@@ -33,8 +31,24 @@ const TG_CODES = [
 
 function mapTgError(e) {
   const m = String(e?.errorMessage ?? e?.message ?? e);
-  if (/(PHONE|NETWORK|USER)_MIGRATE_\d+/.test(m)) {
-    return new Error("PHONE_MIGRATE_UNSUPPORTED"); // loud: see module header
+  const migration = /(PHONE|NETWORK|USER)_MIGRATE_(\d+)/i.exec(m);
+  if (migration) return new Error(`${migration[1].toUpperCase()}_MIGRATE_${migration[2]}`);
+
+  // GramJS exposes the target as `newDc` and rewrites Telegram's canonical
+  // migration code into a human-readable "... associated with DC N" message.
+  const humanMigration = /associated with DC\s+(\d+)/i.exec(m);
+  const migratedDc = Number(e?.newDc ?? humanMigration?.[1]);
+  if (Number.isInteger(migratedDc) && migratedDc > 0) {
+    const errorName = String(e?.constructor?.name ?? "");
+    let migrationType = null;
+    if (/PhoneMigrateError/i.test(errorName) || /phone number/i.test(m)) {
+      migrationType = "PHONE";
+    } else if (/UserMigrateError/i.test(errorName) || /user identity/i.test(m)) {
+      migrationType = "USER";
+    } else if (/NetworkMigrateError/i.test(errorName) || /source IP/i.test(m)) {
+      migrationType = "NETWORK";
+    }
+    if (migrationType) return new Error(`${migrationType}_MIGRATE_${migratedDc}`);
   }
   for (const code of TG_CODES) if (m.includes(code)) return new Error(code);
   return e instanceof Error ? e : new Error(m);
@@ -71,6 +85,7 @@ export async function makeOnboardingTransport({ conn, apiId, apiHash }) {
   return {
     connect: () => conn.connect(),
     disconnect: () => conn.disconnect(),
+    migrateOnboardingDc: (dcId) => conn.migrateOnboardingDc(dcId),
 
     // The freshly-minted session, for sealing ONLY. Stays inside the enclave.
     exportSession: () => conn.session.save(),

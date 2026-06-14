@@ -24,7 +24,8 @@ import { OnboardingManager } from "./onboarding.mjs";
 
 const sha256b64 = (s) => createHash("sha256").update(Buffer.from(s, "base64")).digest("base64");
 
-export function makeOnboardingService({ effects, attest, pcr0g, releaseRecordDigest, ownerEmailFor }) {
+export function makeOnboardingService({ effects, attest, pcr0g, releaseRecordDigest, ownerEmailFor, onTiming }) {
+  const emitT = (m) => { try { if (onTiming) onTiming(m); } catch { /* timing is best-effort */ } };
   if (typeof attest !== "function" || !pcr0g || !releaseRecordDigest) {
     throw new Error("onboarding service: attest, pcr0g, releaseRecordDigest required");
   }
@@ -60,14 +61,21 @@ export function makeOnboardingService({ effects, attest, pcr0g, releaseRecordDig
         return;
       }
       if (f.type !== "op" || !f.frame) continue;
+      // [diag] time the FULL step the browser waits on: decrypt + dispatch + seal +
+      // write. Sub-legs (effects/KMS/SA/Telegram-invoke) are timed independently, so
+      // STEP minus the sum of its legs is the time spent purely in enclave dispatch.
+      const tStep = Date.now();
+      let op0 = "?";
       let reply;
       try {
         const { op, args } = channel.open(f.frame);
+        op0 = op;
         reply = { ok: true, result: await dispatch({ op, args, onb, gen, pcr0g, channelKeyHash, ownerEmailFor }) };
       } catch (e) {
         reply = { ok: false, error: String(e?.message ?? e).slice(0, 200) };
       }
       await writeFrame({ type: "reply", frame: channel.seal(reply) });
+      emitT(`STEP ${op0} ${Date.now() - tStep}ms`);
     }
   }
 

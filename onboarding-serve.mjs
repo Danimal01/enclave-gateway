@@ -124,11 +124,25 @@ export function makeOnboardingEffects({
 
     // Transport-routed effects (per-ceremony via link).
     sendCode: ({ link, phone }) => slot(link).transport.sendCode({ phone }),
+    migrateOnboardingDc: ({ link, dcId }) => slot(link).transport.migrateOnboardingDc(dcId),
     signIn: ({ link, phone, hash, code }) => slot(link).transport.signIn({ phone, hash, code }),
     getPassword: ({ link }) => slot(link).transport.getPassword(),
     checkPassword: ({ link, A, M1 }) => slot(link).transport.checkPassword({ A, M1 }),
     getMe: ({ link }) => slot(link).transport.getMe(),
     listSessions: ({ link }) => slot(link).transport.listSessions(),
+    publishSessions: async ({ link, sessions }) => {
+      const rows = sessions.map((s) => ({
+        hash: String(s.hash), device_model: s.deviceModel ?? null,
+        platform: s.platform ?? null, system_version: s.systemVersion ?? null,
+        app_name: s.appName ?? null, ip: s.ip ?? null, country: s.country ?? null,
+        region: s.region ?? null, date_created: s.dateCreated ?? null,
+        date_active: s.dateActive ?? null, is_current: !!s.current,
+      }));
+      await db.rpc("gateway_publish_state", {
+        p_link: link, p_sessions: JSON.stringify(rows),
+        p_guard_status: null, p_notes: JSON.stringify({}),
+      });
+    },
 
     finalizeSeal: async ({ link, state, expectedRecoveryDigest, expectedGeneration, tgUserId, firstName, username }) => {
       const sc = slot(link).signersCommit;
