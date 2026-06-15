@@ -11,9 +11,9 @@
 # standby and re-attests on a cadence — it never crash-loops.
 #
 # The gateway is the SESSION-HOLDER. It has the Telegram route (api.telegram.org)
-# and the KMS/State-Authority/Supabase routes. The BRAIN runs in a SEPARATE
-# enclave on a SEPARATE parent with NO Telegram route (4.1, 5.5) and has its own
-# entrypoint; the two never share this image.
+# and the KMS/State-Authority/Supabase routes. The security-decision logic (brain)
+# is composed in-process here (gateway-main wires it into the Gateway); this image
+# is the only enclave in the current deployment.
 set -uo pipefail
 mkdir -p /dev/net; [ -e /dev/net/tun ] || mknod /dev/net/tun c 10 200; chmod 600 /dev/net/tun
 ip link set lo up

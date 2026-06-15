@@ -2,9 +2,8 @@
 // (gateway-brain-architecture.md 4.2, 4.3). Built from GramJS's exported
 // primitives (MTProtoSender + ConnectionTCPFull) WITHOUT the high-level
 // TelegramClient, so the ~200 invoke-wrapping helpers are not in the process.
-// The static census (tests/gateway-audited-sender.test.ts) asserts the
-// high-level client is never instantiated and no banned `telegram/client/*`
-// helper path is imported.
+// The high-level client is never instantiated and no `telegram/client/*` helper
+// path is imported: this file imports only the low-level network primitives below.
 //
 // This module is the connectionFactory gateway-main.mjs injects into the
 // composed Gateway. Every account-capable frame passes the audited
@@ -13,10 +12,10 @@
 // pinned InvokeWithLayer(InitConnection(help.getConfig)); DC migration uses the
 // chokepoint-constrained export/importAuthorization handshake.
 //
-// LIVE-ONLY: connect() opens a real socket and runs the auth-key handshake; it
-// is validated by the fake-DC captured-wire suite on the Nitro host (gate 4),
-// not off-host. The construction below mirrors GramJS _connectSender exactly so
-// the behavior matches the audited, pinned client semantics.
+// LIVE-ONLY: connect() opens a real socket and runs the auth-key handshake, which
+// run only inside the enclave against real Telegram DCs. The construction below
+// mirrors GramJS _connectSender exactly so the behavior matches the pinned client
+// semantics.
 
 // telegram is CommonJS; the low-level sender/connection live in the network
 // submodule, not the root. Default-import + destructure is the reliable ESM

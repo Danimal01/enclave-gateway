@@ -6,8 +6,8 @@
 // immediately before encryptMessageData, including frames the sender enqueues
 // internally. The recursive unwrap closes the nesting bypass
 // (InvokeWithLayer{query: messages.GetHistory} etc.); the per-RequestState
-// check at serialization closes the enqueue bypass; the connection-write
-// census (CI) closes the pre-auth and alternate-socket bypasses.
+// check at serialization closes the enqueue bypass; the two-write-site structure
+// of the connection (connection.mjs) closes the pre-auth and alternate-socket bypasses.
 //
 // There is NO generic invoke. A request type absent from these sets cannot be
 // sent, and adding one changes this published file and therefore PCR0_G.
@@ -51,8 +51,8 @@ const ARMED_ONLY = new Set([
 ]);
 
 // The few internal frame types the sender legitimately self-sends. Enumerated
-// by EXACT type, never a catch-all. CI asserts the pinned build self-sends
-// nothing outside this set.
+// by EXACT type, never a catch-all; the pinned build self-sends nothing outside
+// this set.
 export const TRANSPORT = new Set([
   Api.MsgsAck.CONSTRUCTOR_ID,
   Api.Ping.CONSTRUCTOR_ID,

@@ -5,8 +5,7 @@
 // client also enqueues via addStateToQueue, and the send loop pulls
 // RequestStates off _sendQueue and serializes them directly, so MsgsAck/Ping
 // and bring-up frames never pass through send(). The gateway therefore audits
-// the MessagePacker at TWO seams, and CI asserts these are the only paths to
-// the wire:
+// the MessagePacker at TWO seams, which are the only paths to the wire:
 //
 //   1. append(state): the earliest point a RequestState enters the queue,
 //      BEFORE writeDataAsMessage serializes it to bytes. assertAllowed runs on
@@ -24,8 +23,8 @@
 //
 // This installs the audit on a constructed MTProtoSender instance rather than
 // maintaining a full source fork, so it tracks the pinned GramJS build exactly
-// (the lockfile pins the version; CI asserts the seam shape). The published
-// gateway ships this file plus the pinned dependency.
+// (the lockfile pins the version). The published gateway ships this file plus
+// the pinned dependency.
 
 export function installAuditedSerialization(sender, chokepoint, { onViolation } = {}) {
   const packer = sender._sendQueue;
@@ -80,7 +79,7 @@ export function installAuditedSerialization(sender, chokepoint, { onViolation } 
   return sender;
 }
 
-// The set of internal frames the sender legitimately self-sends. CI asserts the
-// pinned build self-sends nothing outside this set; any unenumerated self-send
-// fails the build rather than passing silently (spec 4.3 self-sent service set).
+// The set of internal frames the sender legitimately self-sends. The pinned
+// build self-sends nothing outside this set; an unenumerated self-send is
+// rejected at the audited seam, not passed silently (spec 4.3 self-sent set).
 export const EXPECTED_SELF_SENT = Object.freeze(["MsgsAck", "Ping", "PingDelayDisconnect", "MsgsStateInfo"]);

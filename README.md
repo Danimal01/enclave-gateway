@@ -76,15 +76,15 @@ the commit (and tag) in `RELEASE.json` are the immutable, timestamped public
 record of exactly this source.
 
 ```
-PCR0_G = 71f31012e58dbd8dd03160c7aeafc9d632f3eddf7c97b1de75faa1db1812a937471bf9c1e71fae84627e1276cf33fed5
+PCR0_G = bdb710f87b683a235e27a2a7413c83769d89183d1730ea69dfd2d9c5dc56548f329a6b6c1064861405a0d6d8d50fceef
 ```
 
 Verify it yourself, three independent ways:
 
 1. **The capability file.** `sha256sum tg-chokepoint.mjs` prints
-   `3a09bb77e4b7a2c9ddc47a5ded548186894cf0680fc2dfd933228998646d3598` (also in
+   `523899749491033fe20d17dbfb80cf600f2f72932fb7653c0b4da08df3084412` (also in
    `RELEASE.json` `files[]`). Note: `RELEASE.json`'s `allowlist_sha256`
-   (`42dbe24…`) is a *different, documented* value, the attestation-binding digest
+   (`733d2164…`) is a *different, documented* value, the attestation-binding digest
    computed over the `// FILE tg-chokepoint.mjs\n` + bytes preimage (what the live
    attestation and the how-it-works page check). Both numbers are published, so
    whichever you compute matches a documented one.
