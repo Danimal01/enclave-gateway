@@ -37,6 +37,16 @@ function floodWaitSeconds(e) {
 // is excluded). These are the ops a FLOOD_WAIT backoff must suppress.
 const MTPROTO_OPS = new Set(["LIST_SESSIONS", "READ_SECURITY_STATE", "EVICT_SESSION", "DECLINE_RESET", "LOGOUT_SELF"]);
 
+// L1 self-heal (always-healthy design): an adopted account must complete a real
+// Telegram round-trip (a sweep/security read, or the connection's 15s keepalive
+// ping) within this window; otherwise its connection is presumed wedged and the
+// per-account watchdog rebuilds it surgically (same lease, no enclave restart).
+// Must be > the keepalive interval (15s, so a quiet healthy account is proven
+// alive ~5x per window) and < the lease TTL (~60s). 75s tolerates ~5 missed pings.
+const LIVENESS_STALE_MS = Number(process.env.GW_LIVENESS_STALE_MS || 75000);
+// After this many failed surgical reconnects, escalate to selfFence + re-adopt (L2).
+const MAX_RECONNECT_ATTEMPTS = 5;
+
 // Stable signature of the LIVE roster. Includes every security-relevant and
 // display-identity field (IP, country, device, app, unconfirmed) so a session
 // that moves or appears unconfirmed republishes. Only the high-churn timestamps
@@ -93,11 +103,13 @@ export class Gateway {
   }
 
   _clock() { return (this._d.now ?? (() => Date.now()))(); }
+  // Monotonic clock for liveness/lease deadlines (never walks backward on NTP step).
+  _mono() { return (this._d.monotonic ?? (() => Date.now()))(); }
 
   // Adopt an armed link: acquire the lease, KMS-open the v3 FINAL envelope under
   // the exact context, run binding-1/2, derive authority, and start serving.
   async adopt(row, holder, leaseTtlMs) {
-    const { authorityClient, openEnvelopeV3, policyStore, verifierCfg, transportFactory } = this._d;
+    const { authorityClient, policyStore, verifierCfg } = this._d;
 
     // 1. State Authority: read -> reject TERMINAL -> acquire the exclusive lease.
     const rec = await authorityClient.read(row.state_id);
@@ -106,43 +118,13 @@ export class Gateway {
     const lease = await authorityClient.acquireLease(row.state_id, holder, leaseTtlMs);
     const gen = lease.record.lease_epoch;
 
-    // 2. KMS-open the FINAL envelope; binding-1 byte-compares inner vs row.
+    const handle = `acct-${row.state_id}`;
     let tx = null;
     try {
-      const dataKey = await this._d.kms.decryptDataKey({ encryptedDataKey: row.seal_encrypted_data_key, contextId: row.kms_context_id, creds: await this._d.freshCreds() });
-      let opened;
-      try {
-        opened = openEnvelopeV3({
-          dataKey,
-          nonce: row.seal_nonce, ciphertext: row.seal_ciphertext, tag: row.seal_tag,
-          expected: {
-            sealPhase: "FINAL", sealGeneration: row.seal_generation,
-            linkId: row.id, tgUserId: row.tg_user_id, stateId: row.state_id,
-            kmsContextId: row.kms_context_id, signersCommit: row.signers_commit,
-          },
-        });
-      } finally {
-        dataKey.fill(0);
-      }
-
-      // 3. Build the audited armed transport and connect; binding-2 = whoAmI.
-      const handle = `acct-${row.state_id}`;
-      // onReconnect: after the connection drops and re-establishes, immediately
-      // sweep this account to catch any login that happened during the gap (we do
-      // not track pts/getDifference, so a pushed UpdateNewAuthorization in the
-      // window would otherwise only surface on the next periodic poll).
-      tx = await transportFactory({
-        mode: MODES.ARMED,
-        session: opened.session,
-        onNewAuth: (evt) => this._onNewAuth(handle, evt),
-        onReconnect: () => { this.sweepAccount(handle).catch(() => {}); },
-      });
-      opened.session = null;
-      await tx.connect();
-      const me = await tx.whoAmI();
-      if (String(me.tgUserId) !== String(row.tg_user_id)) {
-        throw new Error("adopt: binding-2 identity mismatch");
-      }
+      // 2-3. KMS-open the FINAL envelope (binding-1) + connect the audited armed
+      // transport + binding-2 whoAmI. Shared with recoverAccount (L1) so a rebuild
+      // re-opens the sealed session through KMS with identical semantics.
+      tx = await this._openAndConnect(handle, row, row.tg_user_id);
 
       // 4. Derive authority from the signed chain anchored at the State Authority head.
       const rows = await policyStore(row.id);
@@ -166,6 +148,13 @@ export class Gateway {
         renewFail: 0,          // consecutive lease-renewal failures (C6: tolerate transients before fencing)
         frozenUntil: null,     // backoff while the account is frozen (account_frozen)
         frozenAlerted: false,  // one-shot guard for the account_frozen event
+        // L1 self-heal state:
+        row,                   // the sealed (encrypted) descriptor, retained for KMS-reopen on rebuild
+        lastRtOkAt: this._mono(), // monotonic ts of the last successful Telegram round-trip (proven-work liveness)
+        reconnectAttempts: 0,  // consecutive failed surgical reconnects, escalates to selfFence at MAX
+        downSince: null,       // monotonic ts the account first went unhealthy (for honest degraded reporting)
+        selfHealing: false,    // re-entrancy guard while recoverAccount is rebuilding this account
+        degradedAlerted: false,// one-shot guard for a future guard_degraded event
       };
       this._accts.set(handle, ctx);
       this._byState.set(row.state_id, handle);
@@ -513,5 +502,150 @@ export class Gateway {
     try {
       await this._d.publishState?.({ linkId: ctx.linkId, sessions: null, status: "down", notes: { reason } });
     } catch { /* the off-box heartbeat also detects an unavailable gateway */ }
+  }
+
+  // Open the sealed FINAL envelope through KMS (binding-1), build the audited armed
+  // transport, connect, and verify binding-2 (whoAmI == expected). Shared by adopt
+  // (first connect) and recoverAccount (L1 rebuild) so a rebuild re-opens the sealed
+  // session with identical semantics. The plaintext session is zeroed the moment the
+  // transport consumes it; the encrypted envelope (ctx.row) is re-decrypted fresh on
+  // every rebuild and never cached open.
+  async _openAndConnect(handle, row, expectedTgUserId) {
+    const dataKey = await this._d.kms.decryptDataKey({
+      encryptedDataKey: row.seal_encrypted_data_key, contextId: row.kms_context_id, creds: await this._d.freshCreds(),
+    });
+    let opened;
+    try {
+      opened = this._d.openEnvelopeV3({
+        dataKey,
+        nonce: row.seal_nonce, ciphertext: row.seal_ciphertext, tag: row.seal_tag,
+        expected: {
+          sealPhase: "FINAL", sealGeneration: row.seal_generation,
+          linkId: row.id, tgUserId: row.tg_user_id, stateId: row.state_id,
+          kmsContextId: row.kms_context_id, signersCommit: row.signers_commit,
+        },
+      });
+    } finally {
+      dataKey.fill(0);
+    }
+    // onReconnect: catch any login that happened during a GramJS-internal reconnect.
+    // onRtOk: stamp proven-work liveness on EVERY successful round-trip (both sweeps
+    // and the 15s keepalive ping route through invoke()), so a quiet-but-healthy
+    // account stays provably alive and the watchdog never false-trips it.
+    const tx = await this._d.transportFactory({
+      mode: MODES.ARMED,
+      session: opened.session,
+      onNewAuth: (evt) => this._onNewAuth(handle, evt),
+      onReconnect: () => { this.sweepAccount(handle).catch(() => {}); },
+      onRtOk: () => { const c = this._accts.get(handle); if (c) c.lastRtOkAt = this._mono(); },
+    });
+    opened.session = null;
+    await tx.connect();
+    const me = await tx.whoAmI();
+    if (String(me.tgUserId) !== String(expectedTgUserId)) {
+      try { await tx.disconnect(); } catch { /* nothing to clean */ }
+      throw new Error("binding-2 identity mismatch");
+    }
+    return tx;
+  }
+
+  // L1: the per-account liveness watchdog. Runs on its OWN timer (gateway-main),
+  // entirely OUTSIDE the per-account opChain, so it can notice a chain that is
+  // wedged behind a dead promise -- the exact thing that made the 2026-06-14
+  // outage invisible. For each account whose last proven round-trip is older than
+  // LIVENESS_STALE_MS, trigger a surgical rebuild. Deliberately-quiet accounts
+  // (flood/frozen backoff) are stamped, not tripped.
+  accountWatchdog() {
+    const mono = this._mono();
+    for (const [handle, ctx] of [...this._accts]) {
+      if (ctx.selfHealing) continue;
+      const quiet = (ctx.floodUntil && this._clock() < ctx.floodUntil) || (ctx.frozenUntil && this._clock() < ctx.frozenUntil);
+      if (quiet) { ctx.lastRtOkAt = mono; continue; }
+      if (mono - ctx.lastRtOkAt > LIVENESS_STALE_MS) {
+        this._d.logger?.(`[${handle}] liveness stale ${Math.round((mono - ctx.lastRtOkAt) / 1000)}s -> self-heal`);
+        this.recoverAccount(handle).catch(() => {}); // detached: never block the watchdog loop
+      }
+    }
+  }
+
+  // L1: surgically rebuild ONE account's connection with no enclave restart and
+  // WITHOUT releasing the lease (we still hold it; renewal never stopped). Abandon
+  // the poisoned op chain, re-open the sealed session through KMS, reconnect, re-bind
+  // identity, resume sweeping. Escalate to selfFence (L2) after MAX_RECONNECT_ATTEMPTS.
+  async recoverAccount(handle) {
+    const ctx = this._accts.get(handle);
+    if (!ctx || ctx.selfHealing) return;
+    ctx.selfHealing = true;
+    if (!ctx.downSince) ctx.downSince = this._mono();
+    const oldTx = ctx.tx;
+    try {
+      try { await oldTx?.disconnect(); } catch { /* already down */ }
+      ctx.opChain = Promise.resolve(); // abandon the chain wedged behind the dead promise
+      let tx;
+      try {
+        tx = await this._openAndConnect(handle, ctx.row, ctx.tgUserId);
+      } catch (e) {
+        // A binding-2 identity mismatch is NEVER retryable: do not guard the wrong
+        // account. Fence immediately.
+        if (/identity mismatch/i.test(String(e?.message))) {
+          await this.selfFence(handle, "self-heal identity mismatch");
+          return;
+        }
+        throw e;
+      }
+      const cur = this._accts.get(handle);
+      if (!cur) { try { await tx.disconnect(); } catch { /* fenced mid-rebuild */ } return; }
+      cur.tx = tx;
+      cur.lastRtOkAt = this._mono();
+      cur.reconnectAttempts = 0;
+      cur.downSince = null;
+      cur.degradedAlerted = false;
+      this._d.logger?.(`[${handle}] self-healed: reconnected and re-bound`);
+      this.sweepAccount(handle).catch(() => {}); // catch up immediately
+    } catch (e) {
+      ctx.reconnectAttempts = (ctx.reconnectAttempts ?? 0) + 1;
+      this._d.logger?.(`[${handle}] self-heal attempt ${ctx.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} failed: ${e.message}`);
+      if (ctx.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
+        await this.selfFence(handle, `self-heal exhausted: ${e.message}`);
+      }
+      // else: lastRtOkAt stays stale; the next watchdog tick re-triggers (the timer
+      // cadence is the retry backoff).
+    } finally {
+      const cur = this._accts.get(handle);
+      if (cur) cur.selfHealing = false;
+    }
+  }
+
+  // Honest health: accounts proven alive by a recent round-trip (or deliberately
+  // quiet via flood/frozen backoff). Replaces adoptedCount() as the heartbeat's
+  // "guarding" signal, so a heartbeat can never read green while sweeps are dead.
+  healthyCount() {
+    const mono = this._mono();
+    let n = 0;
+    for (const ctx of this._accts.values()) {
+      const quiet = (ctx.floodUntil && this._clock() < ctx.floodUntil) || (ctx.frozenUntil && this._clock() < ctx.frozenUntil);
+      if (quiet || (mono - ctx.lastRtOkAt) < LIVENESS_STALE_MS) n++;
+    }
+    return n;
+  }
+
+  // Per-account liveness ages for the GWSTATUS:LIVE beacon the host watchdog reads.
+  livenessAges() {
+    const mono = this._mono();
+    return [...this._accts.values()].map((ctx) => ({ stateId: ctx.stateId, ageMs: mono - ctx.lastRtOkAt, gen: ctx.gen }));
+  }
+
+  // Graceful shutdown (SIGTERM): disconnect every account BEFORE releasing its
+  // lease, so the outgoing enclave is no longer a Telegram writer when the lease
+  // frees. A fresh enclave then re-acquires in seconds (not the ~150s expiry wait)
+  // with zero two-writer overlap -- releaseLease CASes on our exact holder+epoch,
+  // so it can only ever clear our own lease (single-writer invariant preserved).
+  async releaseAllLeases() {
+    for (const [handle, ctx] of [...this._accts]) {
+      try { await ctx.tx.disconnect(); } catch { /* already down */ }
+      try { await this._d.authorityClient.releaseLease(ctx.stateId, ctx.holder, ctx.gen); } catch { /* expires on its own if release fails */ }
+      this._accts.delete(handle);
+      this._byState.delete(ctx.stateId);
+    }
   }
 }

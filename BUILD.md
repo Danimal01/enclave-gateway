@@ -19,7 +19,11 @@ pinned by sha256 so a verifier can confirm them:
 |---|---|---|
 | `kmstool_enclave_cli` | `754d5b16d458ad9925578543db78bde92df4bc7306b84c8983961ab7c9d33e8e` | aws-nitro-enclaves-sdk-c v0.4.5 (commit cd61b61) with `patches/apply-kmstool-context-patch.py` applied, built via `containers/Dockerfile.al2 --target kmstool-enclave-cli` |
 | `libnsm.so` | `b020f96e39162024bb5248408ce12d9997b049549782f0d65511dfbd3782b0e6` | same SDK build |
-| `gvforwarder` | (pin per release) | gvisor-tap-vsock release arm64 |
+| `gvforwarder` | `0f85431ef3dbec8a4fa5bd1ed05dc418a4938e112e4879496056ab23163ecc7f` | gvisor-tap-vsock release, arm64 (aarch64) |
+
+All three are pinned by sha256 (also in `RELEASE.json` `binaries[]`). After staging
+them, confirm each: `sha256sum kmstool_enclave_cli libnsm.so gvforwarder` must match
+the values above before you build.
 
 `patches/apply-kmstool-context-patch.py` adds `--encryption-context` (JSON) to
 the kmstool CLI, wiring it into the SDK's existing

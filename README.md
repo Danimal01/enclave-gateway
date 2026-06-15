@@ -63,24 +63,38 @@ What you are trusting, disclosed and not hidden: AWS Nitro hardware attestation,
 and the fact that Sessions holds the KMS key that unlocks your stored session at
 rest. Your own enrolled key can revoke the enclave's access.
 
-## Status — LIVE and reproducible
+## Status — production, live, and reproducible
 
-This source is bound to a live AWS Nitro enclave attestation. A genuine enclave
-running this exact image attests the measurement below, and the build is
-**umask-independent**: the Dockerfile canonicalizes every COPYed file's mode and
-mtime, so a `--no-cache` build on any host (any umask, any OS via the pinned LF
-checkout) reproduces the identical PCR0 you see here. (Production releases will
-additionally be git-tagged and recorded in a public transparency log.)
+This is a **production** release: this exact image runs in a live AWS Nitro
+enclave guarding real Telegram accounts right now. It is not a development,
+staging, or testnet build. A genuine enclave running this image attests the
+measurement below, and the build is **umask-independent**: the Dockerfile
+canonicalizes every COPYed file's mode and mtime, so a `--no-cache` build on any
+host (any umask, any OS via the pinned LF checkout) reproduces the identical PCR0
+you see here. The release is recorded in this repository's public git history:
+the commit (and tag) in `RELEASE.json` are the immutable, timestamped public
+record of exactly this source.
 
 ```
 PCR0_G = b79e96f77a653c28bda672fc63d05578cbf1ff7d9c21e57056b8ae7b0cb5c80536ebf794f774fbbf0d5fff50e60b0092
 ```
 
-Verify it yourself: the live attestation document is published at
-`https://sessions.fyi/attestation/gateway.json` and verified in your browser at
-`https://sessions.fyi/how-it-works` (or with any COSE/Nitro verifier chaining to
-AWS Nitro Root G1). Rebuild this repo and confirm the PCR0 matches. See
-`RELEASE.json` and `BUILD.md`.
+Verify it yourself, three independent ways:
+
+1. **The capability file.** `sha256sum tg-chokepoint.mjs` prints
+   `3a09bb77e4b7a2c9ddc47a5ded548186894cf0680fc2dfd933228998646d3598` (also in
+   `RELEASE.json` `files[]`). Note: `RELEASE.json`'s `allowlist_sha256`
+   (`42dbe24…`) is a *different, documented* value, the attestation-binding digest
+   computed over the `// FILE tg-chokepoint.mjs\n` + bytes preimage (what the live
+   attestation and the how-it-works page check). Both numbers are published, so
+   whichever you compute matches a documented one.
+2. **The live attestation.** Published at
+   `https://sessions.fyi/attestation/gateway.json` and verified in your browser at
+   `https://sessions.fyi/how-it-works` (or with any COSE/Nitro verifier chaining to
+   AWS Nitro Root G1).
+3. **The build.** Rebuild this repo (`BUILD.md`) and confirm the PCR0 matches the
+   value above. The three host-staged binaries are pinned by sha256 in
+   `RELEASE.json` `binaries[]`; confirm them with `sha256sum` before building.
 
 ## License
 

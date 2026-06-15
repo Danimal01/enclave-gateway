@@ -65,6 +65,13 @@ const DEFAULT_DC_IPS = { 1: "149.154.175.53", 2: "149.154.167.51", 3: "149.154.1
 // Resolve a usable cold-connect timeout. GramJS's own connectTimeout is not read in
 // the pinned build, so we bound connect()/bring-up ourselves.
 const CONNECT_TIMEOUT_MS = Number(process.env.TG_CONNECT_TIMEOUT_MS || 20000);
+// L0 (always-healthy design): bound EVERY steady-state Telegram round-trip. GramJS's
+// sender.send() resolves only when the recv loop matches a reply; on a silent NAT/idle
+// drop the socket neither throws nor emits close, so an un-bounded await orphans
+// FOREVER and wedges the whole per-account op chain (the 2026-06-14 silent-death root
+// cause). A hard wall-clock deadline turns that invisible hang into a thrown,
+// catchable, recoverable error. Well under the lease TTL and the L1 liveness window.
+const INVOKE_TIMEOUT_MS = Number(process.env.TG_INVOKE_TIMEOUT_MS || 25000);
 function withTimeout(p, ms, what) {
   let t;
   const timeout = new Promise((_, rej) => { t = setTimeout(() => rej(new Error(`${what} timed out after ${ms}ms`)), ms); });
@@ -120,7 +127,7 @@ function initConnection(query, apiId) {
 // (ARMED for a sealed session, ONBOARDING for an empty session being minted).
 // Returns the `conn` contract mtproto-client.mjs / gateway.mjs expect:
 //   { sender, connect, disconnect, invoke, onUpdate, migrateDc, chokepoint }
-export async function makeConnection({ session, mode, apiId, apiHash, onAutoReconnect, logger, onTiming }) {
+export async function makeConnection({ session, mode, apiId, apiHash, onAutoReconnect, onRtOk, logger, onTiming }) {
   const emitT = (m) => { try { if (onTiming) onTiming(`${mode} ${m}`); } catch { /* timing is best-effort */ } };
   if (mode !== MODES.ARMED && mode !== MODES.ONBOARDING) throw new Error("makeConnection: bad mode");
   // GramJS needs a Logger OBJECT (with .error/.warn/.info). The gateway passes a
@@ -272,10 +279,22 @@ export async function makeConnection({ session, mode, apiId, apiHash, onAutoReco
     let migrated = false;
     for (let attempt = 0; ; attempt++) {
       try {
-        const r = await sender.send(request);
+        // L0: hard deadline on the round-trip. A silently-dead socket can no longer
+        // orphan this promise forever; it throws and the per-account chain unblocks.
+        const r = await withTimeout(sender.send(request), INVOKE_TIMEOUT_MS, `invoke ${op}`);
+        if (onRtOk) { try { onRtOk(); } catch { /* liveness stamp is best-effort */ } } // proven-work signal
         emitT(`INVOKE ${op} ${Date.now() - t0}ms a=${attempt}`); // [instrumentation] true per-op RTT
         return r;
       } catch (e) {
+        // L0: a timed-out call means the socket is wedged. Tear the sender down so it
+        // is not reused, and SURFACE it (never silently retry a hang) so L1's
+        // per-account watchdog rebuilds the connection.
+        if (/timed out after/.test(String(e?.message || ""))) {
+          connected = false;
+          try { if (typeof sender.reconnect === "function") sender.reconnect(); } catch { /* L1 will rebuild */ }
+          emitT(`INVOKE-TIMEOUT ${op} ${Date.now() - t0}ms`);
+          throw e;
+        }
         // ARMED auto-migrate (parity with GramJS client.invoke): a USER/NETWORK_MIGRATE
         // transparently switches DC and retries once, so the account is never silently
         // un-guarded. Onboarding migrates via the manager's cold-switch, so skip here.
@@ -297,8 +316,9 @@ export async function makeConnection({ session, mode, apiId, apiHash, onAutoReco
   async function migrateDc(targetDcId) {
     if (mode !== MODES.ARMED) throw new Error("export/import DC migration is armed-only");
     // Export the authorization from the CURRENT (home) DC sender first (raw send to
-    // avoid invoke's migrate-retry recursing on this very call).
-    const auth = await sender.send(new Api.auth.ExportAuthorization({ dcId: targetDcId }));
+    // avoid invoke's migrate-retry recursing on this very call). Bounded so a wedged
+    // home-DC socket cannot hang the migration forever (L0).
+    const auth = await withTimeout(sender.send(new Api.auth.ExportAuthorization({ dcId: targetDcId })), INVOKE_TIMEOUT_MS, "migrate export");
     const target = dcAddress(targetDcId);
     await disconnect();
     // Mint a FRESH key on the target DC and rebuild the sender (the home-DC key is

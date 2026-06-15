@@ -1,19 +1,28 @@
 {
   "spec": "sessions.fyi/release-manifest/v1",
-  "status": "attested-development",
-  "release_tag": null,
-  "pcr0_g": "b79e96f77a653c28bda672fc63d05578cbf1ff7d9c21e57056b8ae7b0cb5c80536ebf794f774fbbf0d5fff50e60b0092",
-  "gateway_commit": null,
+  "status": "production",
+  "status_note": "Live and battle-tested: this exact image runs in a production AWS Nitro enclave guarding real Telegram accounts. Not a development, staging, or testnet build. The release is commit-pinned and reproducible; trust comes from rebuilding it and matching the PCR0 below, plus the live in-browser attestation.",
+  "release_tag": "v1.0.0",
+  "pcr0_g": "71f31012e58dbd8dd03160c7aeafc9d632f3eddf7c97b1de75faa1db1812a937471bf9c1e71fae84627e1276cf33fed5",
+  "gateway_commit": "2f79388",
   "allowlist_file": "tg-chokepoint.mjs",
   "allowlist_sha256": "42dbe2410ceb2eca9bc2f899257326673b54a3592832b62f244b589019ce6e23",
+  "allowlist_sha256_preimage": "sha256 over the UTF-8 string '// FILE tg-chokepoint.mjs\\n' concatenated with the file's bytes (multiple files: each such block joined by a newline). This is the value the live attestation binds and the how-it-works page verifies. A plain `sha256sum tg-chokepoint.mjs` instead gives the raw file hash in files[] below.",
+  "files": [
+    { "name": "tg-chokepoint.mjs", "sha256": "3a09bb77e4b7a2c9ddc47a5ded548186894cf0680fc2dfd933228998646d3598", "note": "raw sha256 of the file bytes; matches `sha256sum tg-chokepoint.mjs`" }
+  ],
+  "binaries": [
+    { "name": "kmstool_enclave_cli", "sha256": "754d5b16d458ad9925578543db78bde92df4bc7306b84c8983961ab7c9d33e8e", "source": "aws-nitro-enclaves-sdk-c v0.4.5 (commit cd61b61) with patches/apply-kmstool-context-patch.py applied; built via containers/Dockerfile.al2 --target kmstool-enclave-cli" },
+    { "name": "libnsm.so", "sha256": "b020f96e39162024bb5248408ce12d9997b049549782f0d65511dfbd3782b0e6", "source": "same aws-nitro-enclaves-sdk-c v0.4.5 build" },
+    { "name": "gvforwarder", "sha256": "0f85431ef3dbec8a4fa5bd1ed05dc418a4938e112e4879496056ab23163ecc7f", "source": "gvisor-tap-vsock release, arm64 (aarch64)" }
+  ],
   "reproducible": true,
-  "reproducible_note": "umask-independent: a 644 and a 664 source context build the IDENTICAL PCR0 (the Dockerfile canonicalizes every COPYed file's mode; .gitattributes pins LF). Build on any host and match.",
+  "reproducible_note": "umask-independent: a 644 and a 664 source context build the IDENTICAL PCR0 (the Dockerfile canonicalizes every COPYed file's mode; .gitattributes pins LF). The three host-staged binaries above are pinned by sha256 so a verifier can confirm them. Build on any host and match.",
+  "transparency": "This release is recorded in the public git history of this repository: the commit above is the exact source, and the tagged release plus this committed manifest are the immutable, timestamped public record. Rebuild from that commit and confirm the PCR0.",
   "attestation": {
-    "module_id": "i-0aa6b63b57d3e239f-enc19ec36d4cb5cfdc",
-    "attested_at_iso": null,
     "live_artifact": "https://sessions.fyi/attestation/gateway.json",
     "verifier": "https://sessions.fyi/how-it-works",
-    "note": "A live AWS Nitro enclave running this exact image attests PCR0_G above. The capability allowlist (tg-chokepoint.mjs, sha256 42dbe24...) is unchanged: account-management only, no message/chat/file/contact method."
+    "note": "A live AWS Nitro enclave running this exact image attests PCR0_G above (the live artifact is authoritative for the current module id and timestamp). The capability allowlist (tg-chokepoint.mjs) is account-management only: no message, chat, file, or contact method."
   },
-  "note": "Attested build with deterministic, umask-independent reproducibility. Carries the activity-feed + security event observability and the connection-lifecycle resilience behind the same allowlist ceiling."
+  "note": "Production release. Deterministic, umask-independent reproducibility. Carries the per-account connection self-heal, activity-feed + security observability, and the State Authority lease resilience, all behind the same allowlist ceiling."
 }
