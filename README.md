@@ -76,7 +76,7 @@ the commit (and tag) in `RELEASE.json` are the immutable, timestamped public
 record of exactly this source.
 
 ```
-PCR0_G = b79e96f77a653c28bda672fc63d05578cbf1ff7d9c21e57056b8ae7b0cb5c80536ebf794f774fbbf0d5fff50e60b0092
+PCR0_G = 71f31012e58dbd8dd03160c7aeafc9d632f3eddf7c97b1de75faa1db1812a937471bf9c1e71fae84627e1276cf33fed5
 ```
 
 Verify it yourself, three independent ways:
