@@ -4,7 +4,8 @@
   "status_note": "Live and battle-tested: this exact image runs in a production AWS Nitro enclave guarding real Telegram accounts. Not a development, staging, or testnet build. The release is commit-pinned and reproducible; trust comes from rebuilding it and matching the PCR0 below, plus the live in-browser attestation.",
   "release_tag": "v1.0.1",
   "pcr0_g": "bdb710f87b683a235e27a2a7413c83769d89183d1730ea69dfd2d9c5dc56548f329a6b6c1064861405a0d6d8d50fceef",
-  "gateway_commit": "43c7026",
+  "gateway_commit": "e4813dcafb16a8232d8631e10cd8d3f8f6c94946",
+  "gateway_commit_repo": "github.com/Danimal01/enclave-gateway (THIS repository) — resolve gateway_commit here, not elsewhere; it is the commit whose source builds to pcr0_g.",
   "allowlist_file": "tg-chokepoint.mjs",
   "allowlist_sha256": "733d216491e4e593dc07bd34aee4c65385a0ae614301d474e61bf98ef1f5539f",
   "allowlist_sha256_preimage": "sha256 over the UTF-8 string '// FILE tg-chokepoint.mjs\\n' concatenated with the file's bytes (multiple files: each such block joined by a newline). This is the value the live attestation binds and the how-it-works page verifies. A plain `sha256sum tg-chokepoint.mjs` instead gives the raw file hash in files[] below.",
@@ -18,7 +19,7 @@
   ],
   "reproducible": true,
   "reproducible_note": "umask-independent: a 644 and a 664 source context build the IDENTICAL PCR0 (the Dockerfile canonicalizes every COPYed file's mode; .gitattributes pins LF). The three host-staged binaries above are pinned by sha256 so a verifier can confirm them. Build on any host and match.",
-  "transparency": "This release is recorded in the public git history of this repository: the commit above is the exact source, and the tagged release plus this committed manifest are the immutable, timestamped public record. Rebuild from that commit and confirm the PCR0.",
+  "transparency": "To verify: check out tag v1.0.1 of THIS repository (or gateway_commit above), rebuild per BUILD.md, and confirm the PCR0 matches pcr0_g. gateway_commit resolves in this repo only; doc-only commits may sit after it on the tag, but the source that builds to pcr0_g is exactly that commit.",
   "attestation": {
     "live_artifact": "https://sessions.fyi/attestation/gateway.json",
     "verifier": "https://sessions.fyi/how-it-works",
