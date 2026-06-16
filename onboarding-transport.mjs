@@ -60,9 +60,14 @@ function mapTgError(e) {
 function serializeSrp(pwd) {
   const b64 = (x) => (x ? Buffer.from(x).toString("base64") : null);
   const algo = pwd.currentAlgo;
+  // GramJS exposes the server ephemeral as `srp_B` (snake_case), NOT `srpB`.
+  // Reading the wrong name silently serialized null, so the browser built the SRP
+  // proof against a garbage B and Telegram returned PASSWORD_HASH_INVALID for
+  // EVERY password (2FA onboarding never worked). Read srp_B; tolerate srpB too.
+  const srpB = pwd.srp_B ?? pwd.srpB;
   return {
     srpId: pwd.srpId != null ? String(pwd.srpId) : null,
-    srpB: b64(pwd.srpB),
+    srpB: b64(srpB),
     hasPassword: !!pwd.hasPassword,
     algo: algo
       ? {
@@ -113,7 +118,14 @@ export async function makeOnboardingTransport({ conn, apiId, apiHash }) {
     async getPassword() {
       const pwd = await conn.invoke(new Api.account.GetPassword());
       srpId = pwd.srpId; // BigInt; bind the next checkPassword to this exact challenge
-      return serializeSrp(pwd);
+      const params = serializeSrp(pwd);
+      // Fail LOUD if the public SRP challenge is incomplete (e.g. a future GramJS
+      // field rename) instead of shipping a null param that the browser turns into
+      // a wrong proof and a confusing PASSWORD_HASH_INVALID.
+      if (params.algo && (!params.srpB || params.srpId == null)) {
+        throw new Error("getPassword: account.Password missing srp_B/srpId");
+      }
+      return params;
     },
 
     async checkPassword({ A, M1 }) {
