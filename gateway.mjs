@@ -16,7 +16,7 @@
 // set over the admitted channel.
 
 import { MODES } from "./tg-chokepoint.mjs";
-import { deriveAuthority, assertOpAllowed } from "./policy-verify.mjs";
+import { deriveAuthority, assertOpAllowed, payloadHash } from "./policy-verify.mjs";
 import { decodeRequest, encodeResponse, encodeEvent } from "./brain-protocol.mjs";
 import { Brain } from "./brain.mjs";
 
@@ -83,6 +83,7 @@ const EVENT_REASON = {
   account_frozen: "Telegram froze the account",
   eviction_rate_capped: "Multiple unauthorized sessions are being removed in batches",
   guard_connected: "Your Sessions guard connected",
+  guard_disconnected: "Your Sessions guard disconnected and signed out of your account",
 };
 
 export class Gateway {
@@ -127,7 +128,16 @@ export class Gateway {
       tx = await this._openAndConnect(handle, row, row.tg_user_id);
 
       // 4. Derive authority from the signed chain anchored at the State Authority head.
-      const rows = await policyStore(row.id);
+      // A pending signed disconnect sits one past the committed head (the link is
+      // 'disconnecting'); we adopt on the SA-anchored armed authority and let
+      // reconcileDisconnect re-verify the full chain and finalize the logout.
+      // Filtering to the committed head keeps the fail-closed anchor check intact
+      // (a Postgres-injected envelope past the head is ignored here, and is only
+      // ever trusted after reconcileDisconnect independently re-verifies its
+      // signatures) AND lets a restart re-adopt a 'disconnecting' link so the
+      // disconnect actually completes.
+      const allRows = await policyStore(row.id);
+      const rows = (allRows ?? []).filter((r) => r.version <= rec.policy_version);
       const derived = await deriveAuthority(rows, {
         linkId: row.id, tgUserId: row.tg_user_id, signersCommit: row.signers_commit,
         now: this._d.now ?? (() => Date.now()), ...verifierCfg,
@@ -406,6 +416,93 @@ export class Gateway {
       catch (e) { out.push({ handle, error: e.message }); }
     }
     return out;
+  }
+
+  // Finalize a user-initiated disconnect (gateway-brain-architecture.md 4.9). The
+  // web writes a SIGNED disconnect envelope (head action="disconnect") and flips
+  // the link to 'disconnecting'; only the enclave (the auth_key holder) can
+  // complete it. For each adopted account whose freshly-read signed chain ends in
+  // a disconnect, we: re-verify the chain (the gateway is the ceiling, so a forged
+  // Postgres row cannot trigger a logout), sign OURSELVES out of Telegram
+  // (auth.LogOut, which removes the guard device from the user's account),
+  // terminalize the State Authority (ARMED->TERMINAL, atomically clearing the
+  // lease), publish 'disconnected', record the event, and drop the account. Every
+  // step is idempotent so a crash or restart mid-way is safely retried next cycle.
+  async reconcileDisconnect(handle) {
+    const ctx = this._accts.get(handle);
+    if (!ctx) return null;
+    const { authorityClient, policyStore, verifierCfg } = this._d;
+
+    // Cheap pre-check OUTSIDE the per-account lock: act only when the fresh signed
+    // chain's head is a disconnect (the common case is no-op).
+    let rows;
+    try { rows = await policyStore(ctx.linkId); }
+    catch (e) { this._d.logger?.(`disconnect: policy read failed for ${ctx.linkId}: ${e.message}`); return null; }
+    const ordered = [...(rows ?? [])].sort((a, b) => a.version - b.version);
+    const head = ordered[ordered.length - 1];
+    if (!head || String(head.action) !== "disconnect") return null;
+
+    return this._runSerial(ctx, async () => {
+      if (!this._accts.has(handle)) return null; // dropped while we waited for the lock
+
+      // If the State Authority is already TERMINAL, the logout/terminalize ran on a
+      // prior (interrupted) pass; finish the DB finalize + drop idempotently.
+      let rec;
+      try { rec = await authorityClient.read(ctx.stateId); }
+      catch (e) { this._d.logger?.(`disconnect: SA read failed for ${ctx.linkId}: ${e.message}`); return null; }
+
+      if (rec.phase !== "TERMINAL") {
+        // Re-verify the FULL signed chain ends in this disconnect (fail closed): a
+        // row injected into Postgres without a valid signature quorum derives to
+        // !ok, and we never touch Telegram.
+        const derived = await deriveAuthority(rows, {
+          linkId: ctx.linkId, tgUserId: ctx.tgUserId, signersCommit: ctx.row.signers_commit,
+          now: this._d.now ?? (() => Date.now()), ...verifierCfg,
+        }, { version: head.version, hash: payloadHash("disconnect", head.core) });
+        if (!derived.ok) { this._d.logger?.(`disconnect REFUSED for ${ctx.linkId}: ${derived.reason}`); return null; }
+
+        // The signed disconnect is now the authority; LOGOUT_SELF becomes permitted.
+        ctx.authority = derived.authority;
+
+        // Sign the guard's OWN session out of Telegram (removes the device from the
+        // user's account). logOutSelf treats an already-dead session as "gone".
+        try { await this._call(handle, "LOGOUT_SELF", {}); }
+        catch (e) { this._d.logger?.(`disconnect: logout failed for ${ctx.linkId}: ${e.message}`); return null; }
+
+        // ARMED -> TERMINAL (atomically clears the lease). Best-effort: the session
+        // is already gone, so a transient SA error must not block the DB finalize;
+        // it retries next cycle (rec stays ARMED) or is reconciled by guard-health.
+        try { await authorityClient.markTerminal(ctx.stateId, ctx.holder, ctx.gen, "ARMED", `signed disconnect v${head.version}`, rec.policy_version, rec.policy_head_hash); }
+        catch (e) { this._d.logger?.(`disconnect: markTerminal failed for ${ctx.linkId}: ${e.message}`); }
+      }
+
+      // Finalize: move the link 'disconnecting' -> 'disconnected' and record the
+      // guard_disconnected event, via the enclave-only RPC. (gateway_publish_state
+      // writes guard HEALTH, not the link status, and rejects non-live links, so it
+      // cannot finalize a disconnect.) Gate the drop on this succeeding: the session
+      // is already signed out and the State Authority is TERMINAL, so a transient DB
+      // failure must RETRY (keep the account) rather than strand the row in
+      // 'disconnecting'. Next cycle re-enters via the TERMINAL branch and only the
+      // idempotent finalize remains.
+      try { await this._d.finalizeDisconnect?.({ linkId: ctx.linkId, stateId: ctx.stateId }); }
+      catch (e) { this._d.logger?.(`disconnect: finalize failed for ${ctx.linkId}: ${e.message}`); return null; }
+
+      // Drop the live account: tear the connection down and forget the context.
+      try { await ctx.tx?.disconnect(); } catch { /* already gone */ }
+      this._accts.delete(handle);
+      this._byState.delete(ctx.stateId);
+      this._d.logger?.(`disconnect: finalized ${ctx.linkId} (session signed out, account terminal)`);
+      return { disconnected: true };
+    });
+  }
+
+  // Poll-driven by gateway-main: finalize any adopted account that the user has
+  // disconnected. Safe to run every sweep; it is a no-op for non-disconnecting ones.
+  async reconcileDisconnectsAll() {
+    for (const handle of [...this._accts.keys()]) {
+      try { await this.reconcileDisconnect(handle); }
+      catch (e) { this._d.logger?.(`disconnect reconcile error: ${e.message}`); }
+    }
   }
 
   async checkSecurityAll() {
