@@ -12,6 +12,9 @@ What it *can* do — watch for new logins, remove a session that is not on your
 signed keep-list, decline a hostile 2FA-password reset, and surface those events
 to you — is the entire surface, enumerated in one file you can audit.
 
+> **Current live release: `v1.0.1` — enclave fingerprint PCR0 `bdb710f87b683a235e27a2a7413c83769d89183d1730ea69dfd2d9c5dc56548f329a6b6c1064861405a0d6d8d50fceef`** (2026-06-15).
+> **`RELEASE.json` is the single authoritative, machine-readable record of this build.** Only the fingerprint shown here is live. If you encounter any other PCR0 — in an older commit message, an old tag, or a cached page — it is a *superseded* release, not the current one. When in doubt, read `RELEASE.json` and the raw source files directly, not rendered or cached views.
+
 ## Why this exists (the problem the off-the-shelf stack can't solve)
 
 To guard a Telegram account you must hold its session key — and that key is the
@@ -71,9 +74,8 @@ staging, or testnet build. A genuine enclave running this image attests the
 measurement below, and the build is **umask-independent**: the Dockerfile
 canonicalizes every COPYed file's mode and mtime, so a `--no-cache` build on any
 host (any umask, any OS via the pinned LF checkout) reproduces the identical PCR0
-you see here. The release is recorded in this repository's public git history:
-the commit (and tag) in `RELEASE.json` are the immutable, timestamped public
-record of exactly this source.
+you see here. `RELEASE.json` is the authoritative record of the current build; the
+commit and tag it names simply timestamp exactly this source in the public history.
 
 ```
 PCR0_G = bdb710f87b683a235e27a2a7413c83769d89183d1730ea69dfd2d9c5dc56548f329a6b6c1064861405a0d6d8d50fceef
