@@ -51,6 +51,14 @@ Telegram tooling, designed for full access on a trusted server, cannot offer.
   gateway independently re-derives your signed policy and refuses anything the
   policy does not permit.
 
+**On `auth.exportAuthorization` / `importAuthorization`** (the two most powerful-looking
+verbs in the armed allowlist): they are present only because Telegram requires them to
+migrate a session between data centers. They are called solely by the gateway's own
+internal migration path; no user, relay, or brain input maps to them. The exported
+authorization is consumed by a paired `importAuthorization` on the new DC connection
+inside the same enclave and never leaves enclave memory, so they cannot be used to hand
+your session to another party.
+
 ## The guarantee, stated honestly
 
 This is a **bounded-surface** guarantee backed by readable source plus hardware
