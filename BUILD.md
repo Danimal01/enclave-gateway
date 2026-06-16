@@ -44,6 +44,17 @@ sudo env TMPDIR=~/btmp \
 nitro-cli describe-eif --eif-path gateway.eif   # -> PCR0
 ```
 
-Build twice and confirm the PCR0 matches. Compare it against the value the live
-attestation document publishes (the Sessions how-it-works page renders this
-binding).
+Build twice and confirm the PCR0 matches. The expected value is:
+
+```
+PCR0 = bdb710f87b683a235e27a2a7413c83769d89183d1730ea69dfd2d9c5dc56548f329a6b6c1064861405a0d6d8d50fceef
+```
+
+This is the same `pcr0_g` in `RELEASE.json` and the value the live AWS-signed
+attestation reports.
+
+**Don't want to rebuild?** You don't have to, in order to verify. Open
+`https://sessions.fyi/how-it-works` — it fetches the live attestation, decodes the
+COSE document, validates the certificate chain to **AWS Nitro Enclaves Root G1**,
+extracts PCR0, and checks it equals the value above, all in your browser with no
+tools and no server of ours involved.

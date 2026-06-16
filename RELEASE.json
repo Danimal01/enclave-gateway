@@ -8,9 +8,9 @@
   "gateway_commit_repo": "github.com/Danimal01/enclave-gateway (THIS repository) — resolve gateway_commit here, not elsewhere; it is the commit whose source builds to pcr0_g.",
   "allowlist_file": "tg-chokepoint.mjs",
   "allowlist_sha256": "733d216491e4e593dc07bd34aee4c65385a0ae614301d474e61bf98ef1f5539f",
-  "allowlist_sha256_preimage": "sha256 over the UTF-8 string '// FILE tg-chokepoint.mjs\\n' concatenated with the file's bytes (multiple files: each such block joined by a newline). This is the value the live attestation binds and the how-it-works page verifies. A plain `sha256sum tg-chokepoint.mjs` instead gives the raw file hash in files[] below.",
+  "allowlist_sha256_preimage": "IMPORTANT: allowlist_sha256 is INTENTIONALLY DIFFERENT from files[].sha256 below and is NOT supposed to equal it (this is not a mismatch). allowlist_sha256 = sha256 over the UTF-8 string '// FILE tg-chokepoint.mjs\\n' concatenated with the file's bytes -- the attestation-binding digest the live attestation binds and the how-it-works page verifies. files[].sha256 = the plain `sha256sum tg-chokepoint.mjs`. Two verifiers, two values, same file.",
   "files": [
-    { "name": "tg-chokepoint.mjs", "sha256": "523899749491033fe20d17dbfb80cf600f2f72932fb7653c0b4da08df3084412", "note": "raw sha256 of the file bytes; matches `sha256sum tg-chokepoint.mjs`" }
+    { "name": "tg-chokepoint.mjs", "sha256": "523899749491033fe20d17dbfb80cf600f2f72932fb7653c0b4da08df3084412", "note": "raw sha256 of the file bytes; matches `sha256sum tg-chokepoint.mjs`. Intentionally DIFFERS from the top-level allowlist_sha256 (the attestation-binding digest) -- see allowlist_sha256_preimage." }
   ],
   "binaries": [
     { "name": "kmstool_enclave_cli", "sha256": "754d5b16d458ad9925578543db78bde92df4bc7306b84c8983961ab7c9d33e8e", "source": "aws-nitro-enclaves-sdk-c v0.4.5 (commit cd61b61) with patches/apply-kmstool-context-patch.py applied; built via containers/Dockerfile.al2 --target kmstool-enclave-cli" },

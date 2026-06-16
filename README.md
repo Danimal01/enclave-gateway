@@ -62,9 +62,16 @@ What you can verify yourself:
 3. that you can rebuild this exact source and get the same enclave fingerprint
    (PCR0) that the live attestation reports (see `BUILD.md`).
 
-What you are trusting, disclosed and not hidden: AWS Nitro hardware attestation,
-and the fact that Sessions holds the KMS key that unlocks your stored session at
-rest. Your own enrolled key can revoke the enclave's access.
+What you are trusting, disclosed and not hidden:
+- **AWS is in the trusted base** — the "this exact code is running" proof rests on
+  AWS Nitro hardware attestation chaining to AWS's Nitro Enclaves Root G1.
+- **The at-rest session key.** Your Telegram session is sealed with AWS KMS under a
+  key policy gated on the enclave's measurement (`kms:RecipientAttestation:ImageSha384`,
+  pinned to the PCR0 below), so in normal operation only an enclave running this exact
+  published image can decrypt it, and the host machine cannot. We operate that key, so
+  this is **not** a claim that it is impossible for us to ever reach your session — we
+  control the key policy. What you get is a bounded, attested, **revocable** surface:
+  disconnecting the guard logs it out of your account and ends its access.
 
 ## Status — production, live, and reproducible
 
@@ -81,22 +88,26 @@ commit and tag it names simply timestamp exactly this source in the public histo
 PCR0_G = bdb710f87b683a235e27a2a7413c83769d89183d1730ea69dfd2d9c5dc56548f329a6b6c1064861405a0d6d8d50fceef
 ```
 
-Verify it yourself, three independent ways:
+Verify it yourself:
 
-1. **The capability file.** `sha256sum tg-chokepoint.mjs` prints
-   `523899749491033fe20d17dbfb80cf600f2f72932fb7653c0b4da08df3084412` (also in
-   `RELEASE.json` `files[]`). Note: `RELEASE.json`'s `allowlist_sha256`
-   (`733d2164…`) is a *different, documented* value, the attestation-binding digest
-   computed over the `// FILE tg-chokepoint.mjs\n` + bytes preimage (what the live
-   attestation and the how-it-works page check). Both numbers are published, so
-   whichever you compute matches a documented one.
-2. **The live attestation.** Published at
-   `https://sessions.fyi/attestation/gateway.json` and verified in your browser at
-   `https://sessions.fyi/how-it-works` (or with any COSE/Nitro verifier chaining to
-   AWS Nitro Root G1).
-3. **The build.** Rebuild this repo (`BUILD.md`) and confirm the PCR0 matches the
-   value above. The three host-staged binaries are pinned by sha256 in
-   `RELEASE.json` `binaries[]`; confirm them with `sha256sum` before building.
+1. **Easiest — live, in your browser, no tools (~10s).** Open
+   `https://sessions.fyi/how-it-works`. It fetches the live AWS-signed attestation,
+   decodes the COSE document, validates the certificate chain to the **AWS Nitro
+   Enclaves Root G1**, extracts PCR0, and checks it equals the published value — all
+   client-side, no server of ours involved. It shows green only if every link holds.
+   (The raw document is at `https://sessions.fyi/attestation/gateway.json` for your own
+   COSE/Nitro verifier chaining to AWS Nitro Root G1.)
+2. **Check the capability file.** `sha256sum tg-chokepoint.mjs` →
+   `523899749491033fe20d17dbfb80cf600f2f72932fb7653c0b4da08df3084412` (= `RELEASE.json`
+   `files[].sha256`).
+   > **Two hashes on purpose — this is NOT a mismatch.** `files[].sha256` is the plain
+   > `sha256sum`. The top-level `allowlist_sha256` (`733d2164…`) is a *different,
+   > intentional* value: the attestation-binding digest over the preimage
+   > `// FILE tg-chokepoint.mjs\n` + the file bytes. They are **not supposed to be equal** —
+   > each is simply what a different verifier (a shell vs the attestation) computes over
+   > the same file.
+3. **Rebuild it.** Follow `BUILD.md`; the PCR0 you get must equal the value above
+   (`bdb710f8…d50fceef`) — the same value `RELEASE.json` and the live attestation report.
 
 ## License
 
