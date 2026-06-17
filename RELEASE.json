@@ -2,10 +2,10 @@
   "spec": "sessions.fyi/release-manifest/v1",
   "status": "production",
   "status_note": "Live and battle-tested: this exact image runs in a production AWS Nitro enclave guarding real Telegram accounts. Not a development, staging, or testnet build. The release is commit-pinned and reproducible; trust comes from rebuilding it and matching the PCR0 below, plus the live in-browser attestation.",
-  "release_tag": "v1.0.3",
-  "pcr0_g": "a39e217dc1854d5dd2700e73942dc23aef57bb602f575607f9bbb40958f211ca24704d8ffdbd29bdd83533398bb80e6a",
-  "gateway_commit": "v1.0.3",
-  "gateway_commit_repo": "github.com/Danimal01/enclave-gateway (THIS repository) — resolve gateway_commit/the tag here, not elsewhere; tag v1.0.3 is the source that builds to pcr0_g.",
+  "release_tag": "v1.0.4",
+  "pcr0_g": "be406e4a02a64e519e965485885b81ee0de3d5734ed69cf3ad9259fa5e31334189829126f5f23f1cdb3676bc9bd6df8f",
+  "gateway_commit": "v1.0.4",
+  "gateway_commit_repo": "github.com/Danimal01/enclave-gateway (THIS repository) — resolve gateway_commit/the tag here, not elsewhere; tag v1.0.4 is the source that builds to pcr0_g.",
   "allowlist_file": "tg-chokepoint.mjs",
   "allowlist_sha256": "733d216491e4e593dc07bd34aee4c65385a0ae614301d474e61bf98ef1f5539f",
   "allowlist_sha256_preimage": "IMPORTANT: allowlist_sha256 is INTENTIONALLY DIFFERENT from files[].sha256 below and is NOT supposed to equal it (this is not a mismatch). allowlist_sha256 = sha256 over the UTF-8 string '// FILE tg-chokepoint.mjs\\n' concatenated with the file's bytes -- the attestation-binding digest the live attestation binds and the how-it-works page verifies. files[].sha256 = the plain `sha256sum tg-chokepoint.mjs`. Two verifiers, two values, same file.",
@@ -19,11 +19,11 @@
   ],
   "reproducible": true,
   "reproducible_note": "umask-independent: a 644 and a 664 source context build the IDENTICAL PCR0 (the Dockerfile canonicalizes every COPYed file's mode; .gitattributes pins LF). The three host-staged binaries above are pinned by sha256 so a verifier can confirm them. Build on any host and match.",
-  "transparency": "To verify: check out tag v1.0.3 of THIS repository, rebuild per BUILD.md, and confirm the PCR0 matches pcr0_g. The tag is the exact source that builds to pcr0_g.",
+  "transparency": "To verify: check out tag v1.0.4 of THIS repository, rebuild per BUILD.md, and confirm the PCR0 matches pcr0_g. The tag is the exact source that builds to pcr0_g.",
   "attestation": {
     "live_artifact": "https://sessions.fyi/attestation/gateway.json",
     "verifier": "https://sessions.fyi/how-it-works",
     "note": "A live AWS Nitro enclave running this exact image attests PCR0_G above (the live artifact is authoritative for the current module id and timestamp). The capability allowlist (tg-chokepoint.mjs) is account-management only: no message, chat, file, or contact method."
   },
-  "note": "Production release v1.0.3: 2FA-onboarding SRP fix. The enclave read Telegram's SRP server value from the wrong field name (pwd.srpB instead of GramJS's pwd.srp_B), relaying null, so the browser built the 2FA proof against a garbage B and Telegram rejected every password (PASSWORD_HASH_INVALID). Now reads srp_B, with a loud guard if the public SRP challenge is ever incomplete. Carries forward v1.0.2 disconnect-execution (armed disconnect signs the guard's session out via auth.LogOut, terminalizes the State Authority, and finalizes the link). The allowlist CAPABILITY SET is UNCHANGED from v1.0.1/1.0.2; allowlist_sha256 and files[].sha256 are byte-identical. Deterministic, umask-independent reproducibility."
+  "note": "Production release v1.0.4: instant new-login detection. The gateway keeps Telegram's update-delivery window warm with a lightweight updates.getState every ~12-15s (flood-aware, routed through the per-account FLOOD_WAIT backoff so it cannot hammer during a wait), so a new login is pushed in ~60ms instead of only surfacing on the ~45s getAuthorizations sweep, which remains the authoritative fallback. Carries forward v1.0.3 2FA-onboarding SRP fix and v1.0.2 disconnect-execution. The allowlist CAPABILITY SET is UNCHANGED (updates.getState was already in the allowlist); allowlist_sha256 and files[].sha256 are byte-identical. Deterministic, umask-independent reproducibility."
 }

@@ -35,7 +35,7 @@ function floodWaitSeconds(e) {
 
 // Ops that actually touch Telegram (WHO_AM_I answers from cached identity, so it
 // is excluded). These are the ops a FLOOD_WAIT backoff must suppress.
-const MTPROTO_OPS = new Set(["LIST_SESSIONS", "READ_SECURITY_STATE", "EVICT_SESSION", "DECLINE_RESET", "LOGOUT_SELF"]);
+const MTPROTO_OPS = new Set(["LIST_SESSIONS", "READ_SECURITY_STATE", "EVICT_SESSION", "DECLINE_RESET", "LOGOUT_SELF", "REFRESH_UPDATES"]);
 
 // L1 self-heal (always-healthy design): an adopted account must complete a real
 // Telegram round-trip (a sweep/security read, or the connection's 15s keepalive
@@ -231,6 +231,11 @@ export class Gateway {
         if (!gate.ok) throw new Error(`logout refused: ${gate.reason}`);
         return { goneOrDead: await ctx.tx.logOutSelf() };
       }
+      case "REFRESH_UPDATES":
+        // A pure read (updates.getState) that needs no policy gate: it only keeps
+        // Telegram's update-delivery window open so new-login pushes arrive in real
+        // time (see refreshUpdatesAll). Flood-backoff is applied by _call.
+        return { refreshed: await ctx.tx.refreshUpdates() };
       default:
         throw new Error(`unknown op ${req.op}`);
     }
@@ -260,6 +265,26 @@ export class Gateway {
         this._d.logger?.(`[${handle}] flood-wait ${wait}s — backing off MTProto`);
       }
       throw e;
+    }
+  }
+
+  // Keep Telegram's update channel WARM so a new login (UpdateNewAuthorization) is
+  // PUSHED in ~60ms instead of only surfacing on the ~45s getAuthorizations sweep.
+  // Measured behavior (experiments/probe.mjs): Telegram delivers updates to an
+  // otherwise-quiet connection only while it keeps receiving a CONTENT request inside
+  // a short window (~30s). A transport ping does NOT count, but updates.getState does;
+  // re-issuing it every ~12s holds that window open, turning detection from sweep-bound
+  // into real-time async push. Routed through _call so it shares each account's
+  // FLOOD_WAIT backoff (it cannot hammer during a wait) and the lease/self-fence checks,
+  // and a successful refresh also stamps L1 liveness. Best-effort + fire-and-forget: a
+  // skipped/failed tick just lets that one channel cool until the next, with the
+  // getAuthorizations sweep as the authoritative backstop. Not awaited, so one slow
+  // account never starves the others.
+  refreshUpdatesAll() {
+    for (const handle of this._accts.keys()) {
+      const ctx = this._accts.get(handle);
+      if (ctx?.floodUntil && this._clock() < ctx.floodUntil) continue; // already backing off
+      this._call(handle, "REFRESH_UPDATES").catch(() => { /* the sweep is the backstop */ });
     }
   }
 

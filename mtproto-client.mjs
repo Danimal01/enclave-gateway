@@ -35,8 +35,6 @@
 import { Api } from "telegram";
 import { MODES } from "./tg-chokepoint.mjs";
 
-const KEEPALIVE_MS = 30 * 60 * 1000;
-
 // The single-branch update reader (spec 2.3, 4.5): the handler reads ONLY the
 // new-login update and emits exactly four fields; every other update type,
 // including all message updates, falls through unread in the same tick.
@@ -107,14 +105,6 @@ export async function makeArmedTransport({ conn, onNewAuth }) {
     }
   });
 
-  let keepalive = null;
-  const startKeepalive = () => {
-    keepalive = setInterval(() => {
-      conn.invoke(new Api.updates.GetState()).catch(() => { /* reconnect loop handles it */ });
-    }, KEEPALIVE_MS);
-    if (keepalive.unref) keepalive.unref();
-  };
-
   return {
     sender: conn.sender,
     connect: async () => {
@@ -123,11 +113,20 @@ export async function makeArmedTransport({ conn, onNewAuth }) {
       // time. The high-level client did this on connect; the minimal client must too, or
       // the server may not push new-login updates and detection falls back to the slow
       // periodic sweep. updates.getState is allowlisted; failure is non-fatal (the sweep
-      // is the authoritative fallback detector).
+      // is the authoritative fallback detector). The channel is then kept WARM by the
+      // gateway's flood-aware refreshUpdatesAll loop (REFRESH_UPDATES -> refreshUpdates
+      // below), which re-issues updates.getState every ~12s: Telegram only keeps pushing
+      // to an otherwise-quiet connection while it receives a content-request inside a
+      // short (~30s, measured) window, so this is what makes new-login detection
+      // real-time instead of sweep-bound. (Transport liveness is separate: connection.mjs
+      // pings every 15s.)
       try { await conn.invoke(new Api.updates.GetState()); } catch { /* sweep covers it */ }
-      startKeepalive();
     },
-    disconnect: async () => { if (keepalive) clearInterval(keepalive); await conn.disconnect(); },
+    disconnect: async () => { await conn.disconnect(); },
+    // Warmth ping: re-issue the lightweight update-state content-request that holds
+    // Telegram's push window open (see connect()). Driven by the gateway through the
+    // flood-aware _call path so it shares the per-account FLOOD_WAIT backoff.
+    refreshUpdates: async () => { await conn.invoke(new Api.updates.GetState()); return true; },
     whoAmI: async () => {
       const res = await conn.invoke(new Api.users.GetUsers({ id: [new Api.InputUserSelf()] }));
       const me = Array.isArray(res) ? res[0] : res;
@@ -184,4 +183,4 @@ function publicAuthFields(a) {
   };
 }
 
-export { KEEPALIVE_MS, publicAuthFields };
+export { publicAuthFields };
