@@ -314,33 +314,45 @@ export class Gateway {
     // roster can't be confirmed (flood/transient): record anyway so a real alert is never
     // dropped -- this gates on the ROSTER, not brain-readiness, so the C1 adoption-window
     // push is not lost.
-    let shouldRecord = true;
+    // Record a login_new UNLESS we can POSITIVELY identify the hash as our own current
+    // session or a whitelisted one. Fail-OPEN on everything else -- including a roster that
+    // does not YET list the pushed hash (propagation lag must never drop a real alert; the
+    // prior `!!match && ...` form silently dropped exactly that case).
+    let suppress = false;
     try {
       const view = this._buildPolicyView(handle);
       const { sessions } = await this._call(handle, "LIST_SESSIONS", {});
       const match = (sessions ?? []).find((s) => String(s.hash) === String(evt.hash));
-      shouldRecord = !!match && !match.current && !view?.whitelist?.has(String(evt.hash));
-    } catch { /* fail-open: keep shouldRecord = true */ }
-    if (shouldRecord) {
-      try {
-        await this._d.recordEvent?.({
-          linkId: ctx.linkId,
-          kind: "login_new",
-          reason: EVENT_REASON.login_new,
-          detail: {
-            hash: evt.hash, unconfirmed: !!evt.unconfirmed,
-            device: evt.device ?? null, location: evt.location ?? null,
-          },
-        });
-      } catch (e) {
-        this._d.logger?.(`event publish failed for ${ctx.linkId}: ${e.message}`);
-      }
+      suppress = !!match && (!!match.current || !!view?.whitelist?.has(String(evt.hash)));
+    } catch { /* fail-open: record */ }
+    if (!suppress) {
+      await this._recordLoginNewOnce(ctx, evt.hash, {
+        hash: evt.hash, unconfirmed: !!evt.unconfirmed,
+        device: evt.device ?? null, location: evt.location ?? null,
+      });
     }
     // Protective sweep only once the brain is up (detection is best-effort).
     if (ctx.brain) {
       try { await this.sweepAccount(handle); }
       catch { /* the chokepoint bounds the blast radius */ }
     }
+  }
+
+  // Record a login_new AT MOST ONCE per (account, session hash). Shared by the instant
+  // update-channel path (_onNewAuth, via inline push or getDifference) and the ~45s
+  // roster-diff backstop (sweepAccount) so the two redundant detectors -- which use
+  // completely different Telegram surfaces -- never double-log the same new login.
+  async _recordLoginNewOnce(ctx, hash, detail) {
+    const key = hash == null ? null : String(hash);
+    if (key !== null) {
+      (ctx.recordedLogins ||= new Set());
+      if (ctx.recordedLogins.has(key)) return false;
+      ctx.recordedLogins.add(key);
+    }
+    try {
+      await this._d.recordEvent?.({ linkId: ctx.linkId, kind: "login_new", reason: EVENT_REASON.login_new, hash: key, detail: detail ?? {} });
+    } catch (e) { this._d.logger?.(`login_new record failed for ${ctx.linkId}: ${e.message}`); return false; }
+    return true;
   }
 
   // Serialize all MTProto work for one account onto a single chain so a periodic
@@ -408,8 +420,22 @@ export class Gateway {
             events.push({ kind: "session_location_changed", hash, deviceModel: cu.deviceModel ?? null, country: cu.country ?? null, detail: { device: cu.deviceModel ?? cu.appName ?? null, country: cu.country ?? null, from: p.country ?? null } });
           }
         }
+        // ARRIVALS BACKSTOP: a hash present now but NOT on the previous roster is a new
+        // login. The update channel (inline push / getDifference) normally logs it within
+        // ~12s; this ~45s roster diff is an INDEPENDENT detector (a different Telegram
+        // surface, account.getAuthorizations) so a total update-channel failure still can't
+        // hide a new login. _recordLoginNewOnce dedups by hash, so it fires ONLY if the
+        // instant path missed it. Suppress our own current/whitelisted sessions.
+        const view = this._buildPolicyView(handle);
+        for (const [hash, cu] of curByHash) {
+          if (!prevByHash.has(hash) && !cu.current && !view?.whitelist?.has(String(hash))) {
+            await this._recordLoginNewOnce(ctx, hash, { device: cu.deviceModel ?? cu.appName ?? null, country: cu.country ?? null });
+          }
+        }
       }
-      ctx.lastRoster = sessions;
+      // Snapshot the roster by value so a later mutation of the live list can never
+      // alias the prior-sweep baseline the arrivals/departures diff compares against.
+      ctx.lastRoster = sessions.map((s) => ({ ...s }));
 
       // device_evicted (one per removed session).
       for (const row of result.evicted ?? []) {

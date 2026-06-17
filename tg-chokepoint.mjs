@@ -29,6 +29,9 @@ export const ALLOWED = new Map([
   // unavoidable transport/migration (spec 2.2), each constrained below:
   [Api.help.GetConfig.CONSTRUCTOR_ID,               "help.getConfig"],
   [Api.updates.GetState.CONSTRUCTOR_ID,             "updates.getState"],
+  // Update-state machine gap recovery (keeps the push stream healthy so the no-pts
+  // UpdateNewAuthorization is delivered in real time). Reader discards newMessages.
+  [Api.updates.GetDifference.CONSTRUCTOR_ID,        "updates.getDifference"],
   [Api.auth.ExportAuthorization.CONSTRUCTOR_ID,     "auth.exportAuthorization"],
   [Api.auth.ImportAuthorization.CONSTRUCTOR_ID,     "auth.importAuthorization"],
 ]);

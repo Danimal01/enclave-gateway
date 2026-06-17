@@ -93,13 +93,70 @@ export function makeNoOpEntityCache() {
 //   conn.chokepoint        : the bound chokepoint (connection.mjs owns it and
 //                            installs the audited serialization; the transport
 //                            does NOT re-install, only consumes).
+// Idle threshold: if the update stream goes quiet this long, force a getDifference to
+// self-recover a connection that silently stopped receiving pushes (the spec's
+// "no updates for 15 min -> getDifference" rule, tightened for fast new-login detection).
+const IDLE_DIFF_MS = Number(process.env.GW_IDLE_DIFF_MS || 30000);
+
 export async function makeArmedTransport({ conn, onNewAuth }) {
   if (!conn.chokepoint || conn.chokepoint.mode !== MODES.ARMED) throw new Error("armed transport requires an ARMED connection");
 
+  // ── MTProto update state machine (core.telegram.org/api/updates), validated live
+  // 2026-06-17 (experiments/newauth-updateloop.mjs: 11/11 new-logins caught, push
+  // survived reconnect, getDifference newMessages=0). UpdateNewAuthorization carries NO
+  // pts/qts (it is a bare update in an updateShort) so it is delivered ONLY as a live push
+  // and is NOT durably recoverable from getDifference. To receive it reliably in real time
+  // we keep the update stream HEALTHY like a real client (TDLib/MadelineProto): track
+  // pts/qts/seq/date and, on a seq/pts GAP, on UpdatesTooLong, and on long idle, call
+  // updates.getDifference to resync. getDifference's newMessages/newEncryptedMessages are
+  // DISCARDED unread (single-branch reader, spec 2.3); only otherUpdates is read (measured
+  // newMessages=0 with state kept current). The ~Ns account.getAuthorizations sweep
+  // (gateway.mjs) is the DURABLE backstop for the rare push the healthy stream still drops.
+  let _us = null;          // {pts,qts,date,seq}; advanced via getState seed + getDifference + inline pts/seq
+  let _lastUpdate = 0;
+  let _catching = false;
+  const _seed = (s) => { if (s && typeof s.pts === "number") _us = { pts: s.pts, qts: s.qts ?? 0, date: s.date ?? 0, seq: s.seq ?? 0 }; };
+
+  // Errors (FLOOD_WAIT/transient/401) PROPAGATE so the refreshUpdates caller shares the
+  // gateway's flood backoff; the onUpdate callers ignore them (.catch) and the next
+  // trigger + the getAuthorizations sweep retry. A persistent 401 (session terminated)
+  // surfaces through the same path the gateway's other invokes do.
+  async function _catchUp() {
+    if (!_us || _catching) return;
+    _catching = true;
+    try {
+      for (let i = 0; i < 20; i++) { // bound the slice walk; idle/gap/sweep retry anything left
+        const diff = await conn.invoke(new Api.updates.GetDifference({ pts: _us.pts, qts: _us.qts, date: _us.date }));
+        if (diff instanceof Api.updates.DifferenceEmpty) { _us.date = diff.date; _us.seq = diff.seq; break; }
+        // Read ONLY otherUpdates. newMessages / newEncryptedMessages are DISCARDED unread.
+        for (const u of diff.otherUpdates ?? []) { const evt = filterUpdate(u); if (evt && typeof onNewAuth === "function") onNewAuth(evt); }
+        const s = diff.state || diff.intermediateState;
+        if (s) _us = { pts: s.pts, qts: s.qts, date: s.date, seq: s.seq };
+        if (diff instanceof Api.updates.Difference) break;
+        if (diff instanceof Api.updates.DifferenceTooLong) { _us.pts = diff.pts; break; }
+      }
+    } finally { _catching = false; }
+  }
+
   conn.onUpdate((u) => {
-    // Unwrap the standard update container (the instant new-login push arrives wrapped),
-    // then read ONLY UpdateNewAuthorization from the inner updates.
+    _lastUpdate = Date.now();
+    // UpdatesTooLong: the server deferred updates -> resync (this is the mode a naive client drops).
+    if ((u?.className || u?.constructor?.name) === "UpdatesTooLong") { _catchUp().catch(() => {}); return; }
+    // seq tracking + gap detection on the container (a gap is how a missed new-login surfaces).
+    if (_us && (u instanceof Api.Updates || u instanceof Api.UpdatesCombined)) {
+      const seqStart = (typeof u.seqStart === "number" ? u.seqStart : u.seq);
+      if (typeof seqStart === "number" && seqStart > 0 && _us.seq + 1 < seqStart) _catchUp().catch(() => {});
+      if (typeof u.seq === "number" && u.seq > 0) { _us.seq = u.seq; _us.date = u.date ?? _us.date; }
+    } else if (_us && u instanceof Api.UpdateShort && typeof u.date === "number") {
+      _us.date = u.date;
+    }
+    // pts tracking + gap detection on inner updates; read UpdateNewAuthorization inline (sub-second).
     for (const inner of unwrapUpdates(u)) {
+      if (_us && typeof inner?.pts === "number") {
+        if (typeof inner.ptsCount === "number" && _us.pts + inner.ptsCount < inner.pts) _catchUp().catch(() => {});
+        else if (typeof inner.ptsCount === "number" && _us.pts + inner.ptsCount === inner.pts) _us.pts = inner.pts;
+        else if (inner.pts > _us.pts) _us.pts = inner.pts;
+      }
       const evt = filterUpdate(inner);
       if (evt && typeof onNewAuth === "function") onNewAuth(evt);
     }
@@ -120,13 +177,20 @@ export async function makeArmedTransport({ conn, onNewAuth }) {
       // short (~30s, measured) window, so this is what makes new-login detection
       // real-time instead of sweep-bound. (Transport liveness is separate: connection.mjs
       // pings every 15s.)
-      try { await conn.invoke(new Api.updates.GetState()); } catch { /* sweep covers it */ }
+      // Seed update state so getDifference can resync; this call also opens the push window.
+      try { _seed(await conn.invoke(new Api.updates.GetState())); _lastUpdate = Date.now(); } catch { /* sweep covers it */ }
     },
     disconnect: async () => { await conn.disconnect(); },
-    // Warmth ping: re-issue the lightweight update-state content-request that holds
-    // Telegram's push window open (see connect()). Driven by the gateway through the
-    // flood-aware _call path so it shares the per-account FLOOD_WAIT backoff.
-    refreshUpdates: async () => { await conn.invoke(new Api.updates.GetState()); return true; },
+    // Driven by the gateway's flood-aware warmth loop (~12s). updates.getState holds
+    // Telegram's push window open; we do NOT advance our tracked state from it (that would
+    // skip past unfetched updates). If the stream has gone quiet past the idle threshold we
+    // force a getDifference so a connection that silently stopped pushing self-recovers.
+    refreshUpdates: async () => {
+      if (!_us) { try { _seed(await conn.invoke(new Api.updates.GetState())); _lastUpdate = Date.now(); } catch { return true; } }
+      else { try { await conn.invoke(new Api.updates.GetState()); } catch { /* warmth best-effort */ } }
+      if (_us && Date.now() - _lastUpdate > IDLE_DIFF_MS) { _lastUpdate = Date.now(); await _catchUp(); }
+      return true;
+    },
     whoAmI: async () => {
       const res = await conn.invoke(new Api.users.GetUsers({ id: [new Api.InputUserSelf()] }));
       const me = Array.isArray(res) ? res[0] : res;
