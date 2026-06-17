@@ -305,21 +305,36 @@ export class Gateway {
   async _onNewAuth(handle, evt) {
     const ctx = this._accts.get(handle);
     if (!ctx) return; // no account context at all -> nothing to attribute the event to
-    // Record the login UNCONDITIONALLY (only ctx presence required) -- the old
-    // worker logged first, protected second. Gating the record on brain-readiness
-    // dropped a push that arrived in the adoption window (C1).
+    // Record a login_new ONLY for a hash that is, right now, a REAL non-current,
+    // non-whitelisted session. Telegram reports the guard's OWN session as hash 0, so
+    // the push's real hash never matches a present non-current session -- this stops the
+    // guard flagging its own onboarding login (or a transient setup authorization) as a
+    // scary "new login from an unknown device". A genuine intruder's hash IS present,
+    // non-current and unwhitelisted, so it is still recorded instantly. Fail-OPEN if the
+    // roster can't be confirmed (flood/transient): record anyway so a real alert is never
+    // dropped -- this gates on the ROSTER, not brain-readiness, so the C1 adoption-window
+    // push is not lost.
+    let shouldRecord = true;
     try {
-      await this._d.recordEvent?.({
-        linkId: ctx.linkId,
-        kind: "login_new",
-        reason: EVENT_REASON.login_new,
-        detail: {
-          hash: evt.hash, unconfirmed: !!evt.unconfirmed,
-          device: evt.device ?? null, location: evt.location ?? null,
-        },
-      });
-    } catch (e) {
-      this._d.logger?.(`event publish failed for ${ctx.linkId}: ${e.message}`);
+      const view = this._buildPolicyView(handle);
+      const { sessions } = await this._call(handle, "LIST_SESSIONS", {});
+      const match = (sessions ?? []).find((s) => String(s.hash) === String(evt.hash));
+      shouldRecord = !!match && !match.current && !view?.whitelist?.has(String(evt.hash));
+    } catch { /* fail-open: keep shouldRecord = true */ }
+    if (shouldRecord) {
+      try {
+        await this._d.recordEvent?.({
+          linkId: ctx.linkId,
+          kind: "login_new",
+          reason: EVENT_REASON.login_new,
+          detail: {
+            hash: evt.hash, unconfirmed: !!evt.unconfirmed,
+            device: evt.device ?? null, location: evt.location ?? null,
+          },
+        });
+      } catch (e) {
+        this._d.logger?.(`event publish failed for ${ctx.linkId}: ${e.message}`);
+      }
     }
     // Protective sweep only once the brain is up (detection is best-effort).
     if (ctx.brain) {
@@ -402,7 +417,11 @@ export class Gateway {
       }
 
       // eviction_rate_capped (H4): the brain capped a mass-eviction; alert once/burst.
-      if ((result.pending ?? 0) > 0 && (!ctx.massEvictUntil || this._clock() >= ctx.massEvictUntil)) {
+      // Only when we ACTUALLY evicted a full batch this sweep AND more remain -- i.e. a
+      // genuine flood being whittled down. Without the removed>0 guard this misfired
+      // during the 24h fresh window (removed:0 but pending = every detected session), so
+      // a single held login rendered a bogus "removing N, 3 at a time" alert.
+      if ((result.removed ?? 0) > 0 && (result.pending ?? 0) > 0 && (!ctx.massEvictUntil || this._clock() >= ctx.massEvictUntil)) {
         ctx.massEvictUntil = this._clock() + 3600000;
         events.push({ kind: "eviction_rate_capped", detail: { total: (result.pending ?? 0) + (result.removed ?? 0), perSweep: 3 } });
       } else if ((result.pending ?? 0) === 0) {

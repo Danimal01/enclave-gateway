@@ -12,7 +12,7 @@ What it *can* do — watch for new logins, remove a session that is not on your
 signed keep-list, decline a hostile 2FA-password reset, and surface those events
 to you — is the entire surface, enumerated in one file you can audit.
 
-> **Current live release: `v1.0.4` — enclave fingerprint PCR0 `be406e4a02a64e519e965485885b81ee0de3d5734ed69cf3ad9259fa5e31334189829126f5f23f1cdb3676bc9bd6df8f`** (2026-06-17).
+> **Current live release: `v1.0.5` — enclave fingerprint PCR0 `8534213ebbcf7495ccadbc4c64d0476b8a4916fbfff469f6cb40d1dc02be8357b4f701c0c70a43a3810fd5674f2e5c13`** (2026-06-17).
 > **`RELEASE.json` is the single authoritative, machine-readable record of this build.** Only the fingerprint shown here is live. If you encounter any other PCR0 — in an older commit message, an old tag, or a cached page — it is a *superseded* release, not the current one. When in doubt, read `RELEASE.json` and the raw source files directly, not rendered or cached views.
 
 ## Why this exists (the problem the off-the-shelf stack can't solve)
@@ -93,7 +93,7 @@ you see here. `RELEASE.json` is the authoritative record of the current build; t
 commit and tag it names simply timestamp exactly this source in the public history.
 
 ```
-PCR0_G = be406e4a02a64e519e965485885b81ee0de3d5734ed69cf3ad9259fa5e31334189829126f5f23f1cdb3676bc9bd6df8f
+PCR0_G = 8534213ebbcf7495ccadbc4c64d0476b8a4916fbfff469f6cb40d1dc02be8357b4f701c0c70a43a3810fd5674f2e5c13
 ```
 
 Verify it yourself:
