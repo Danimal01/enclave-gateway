@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Email **security@sessions.fyi** (or hello@sessions.fyi). Include steps to reproduce. We
+Email **danial@sessions.fyi**. Include steps to reproduce. We
 aim to acknowledge within 72 hours. Please do not open public issues for
 security-sensitive reports.
 
