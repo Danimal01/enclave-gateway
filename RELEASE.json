@@ -2,10 +2,10 @@
   "spec": "sessions.fyi/release-manifest/v1",
   "status": "production",
   "status_note": "Live and battle-tested: this exact image runs in a production AWS Nitro enclave guarding real Telegram accounts. Not a development, staging, or testnet build. The release is commit-pinned and reproducible; trust comes from rebuilding it and matching the PCR0 below, plus the live in-browser attestation.",
-  "release_tag": "v1.0.6",
-  "pcr0_g": "9c53c4718ccefb7fb0085267eac72f1238d6f859931e590c9b83bdbb5dbd471b58f5f4f368bdcf7d03563cc128777e4d",
-  "gateway_commit": "v1.0.6",
-  "gateway_commit_repo": "github.com/Danimal01/enclave-gateway (THIS repository) — resolve gateway_commit/the tag here, not elsewhere; tag v1.0.6 is the source that builds to pcr0_g.",
+  "release_tag": "v1.0.7",
+  "pcr0_g": "18f0f9a3f86abca33bcfb220103e86174db0452171f91df9ecb6d82c47bba4d1fb88202832f68c237a4895a7b91ad10b",
+  "gateway_commit": "v1.0.7",
+  "gateway_commit_repo": "github.com/Danimal01/enclave-gateway (THIS repository) — resolve gateway_commit/the tag here, not elsewhere; tag v1.0.7 is the source that builds to pcr0_g.",
   "allowlist_file": "tg-chokepoint.mjs",
   "allowlist_sha256": "3e7ebadb42c4959b7502d1b5a124a0577a7ce212a175fab2a7533310b37d8d19",
   "allowlist_sha256_preimage": "IMPORTANT: allowlist_sha256 is INTENTIONALLY DIFFERENT from files[].sha256 below and is NOT supposed to equal it (this is not a mismatch). allowlist_sha256 = sha256 over the UTF-8 string '// FILE tg-chokepoint.mjs\\n' concatenated with the file's bytes -- the attestation-binding digest the live attestation binds and the how-it-works page verifies. files[].sha256 = the plain `sha256sum tg-chokepoint.mjs`. Two verifiers, two values, same file.",
@@ -19,11 +19,11 @@
   ],
   "reproducible": true,
   "reproducible_note": "umask-independent: a 644 and a 664 source context build the IDENTICAL PCR0 (the Dockerfile canonicalizes every COPYed file's mode; .gitattributes pins LF). The three host-staged binaries above are pinned by sha256 so a verifier can confirm them. Build on any host and match.",
-  "transparency": "To verify: check out tag v1.0.6 of THIS repository, rebuild per BUILD.md, and confirm the PCR0 matches pcr0_g. The tag is the exact source that builds to pcr0_g.",
+  "transparency": "To verify: check out tag v1.0.7 of THIS repository, rebuild per BUILD.md, and confirm the PCR0 matches pcr0_g. The tag is the exact source that builds to pcr0_g.",
   "attestation": {
     "live_artifact": "https://sessions.fyi/attestation/gateway.json",
     "verifier": "https://sessions.fyi/how-it-works",
     "note": "A live AWS Nitro enclave running this exact image attests PCR0_G above (the live artifact is authoritative for the current module id and timestamp). The capability allowlist (tg-chokepoint.mjs) is account-management only: no message, chat, file, or contact method. The one call whose reply can carry message updates, updates.getDifference, is read single-branch (only otherUpdates) and its newMessages are discarded unread."
   },
-  "note": "Production release v1.0.6: reliable 24/7 instant new-login detection. The minimal client now runs the MTProto update state machine (core.telegram.org/api/updates): it tracks pts/qts/seq/date and calls updates.getDifference on a seq/pts gap, on UpdatesTooLong, and on idle, so a long-lived connection's push stream stays healthy and UpdateNewAuthorization (which carries no pts/qts and is push-only) is delivered in real time; the ~7-10s account.getAuthorizations roster diff is the durable backstop. CHANGED vs v1.0.5: updates.getDifference is ADDED to the ARMED allowlist, so allowlist_sha256 and files[].sha256 change accordingly; its reply's newMessages/newEncryptedMessages are DISCARDED unread (single-branch reader, only otherUpdates is processed), so no message content is read. Carries forward v1.0.5 activity-log accuracy, v1.0.4 warmth, v1.0.3 SRP, v1.0.2 disconnect-execution. Deterministic, umask-independent reproducibility."
+  "note": "Production release v1.0.7: fixes an eviction-LOGGING loop with NO capability change (allowlist_sha256 and files[].sha256 are byte-identical to v1.0.6). After a successful account.resetAuthorization, Telegram can keep LISTING the terminated session as a ghost in account.getAuthorizations for minutes; the detection sweep recomputed its target set from the live roster each cycle with no memory, so it re-removed + re-logged + re-emailed the same already-killed session every ~7s until Telegram GCs it. The gateway now dedups against the durable eviction_log keyed on the per-session hash: a hash removed within a 30-min cooldown is not re-proposed (a real new login always carries a NEW hash, so a genuine intruder is never suppressed), a cooled-still-listed ghost is excluded from the roster baseline so it is never misreported as a new login or a sign-out-elsewhere, and a session that genuinely persists past the window falls back into the normal gated batch and is surfaced to the operator. Carries forward v1.0.6 reliable instant new-login detection (updates.getDifference state machine), v1.0.5 activity-log accuracy, v1.0.4 warmth, v1.0.3 SRP, v1.0.2 disconnect-execution. Deterministic, umask-independent reproducibility."
 }

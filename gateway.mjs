@@ -20,6 +20,23 @@ import { deriveAuthority, assertOpAllowed, payloadHash } from "./policy-verify.m
 import { decodeRequest, encodeResponse, encodeEvent } from "./brain-protocol.mjs";
 import { Brain } from "./brain.mjs";
 
+// EVICTION COOLDOWN (eviction-loop incident, 2026-06-18). After a successful
+// account.resetAuthorization, Telegram can keep LISTING the terminated session as a
+// ghost in getAuthorizations for minutes (observed ~5m; Telegram documents no upper
+// bound). The detection sweep recomputes its target set from the LIVE roster each
+// cycle, so without memory it re-evicts + re-logs + re-emails the same ghost every
+// ~7s until Telegram GCs it. We dedup against the durable eviction_log (the single
+// source of truth the dashboard + email trigger already read), keyed on the Telegram
+// per-session hash: a hash removed within EVICT_COOLDOWN_MS is not re-proposed. A real
+// new login always carries a NEW hash, so it is never suppressed. Past the window a
+// still-listed hash falls back into the batch and is re-removed at most once per
+// window; ESCALATE_K repeats inside ORACLE_WINDOW_MS surface a persistent (non-ghost)
+// session to the operator log. DB-backed (not in-memory) so it is correct across
+// enclave restart and lease handoff with no seeding.
+const EVICT_COOLDOWN_MS = Number(process.env.EVICT_COOLDOWN_MS ?? 1_800_000); // 30 min
+const ESCALATE_K = 4;
+const ORACLE_WINDOW_MS = EVICT_COOLDOWN_MS * ESCALATE_K; // lookback for the dedup oracle
+
 // FLOOD_WAIT detection. GramJS rewrites FloodWaitError's `.message` to a human
 // sentence ("A wait of N seconds is required ...") but keeps the wait on
 // `.seconds`; the chokepoint may also surface the canonical FLOOD_WAIT_N code.
@@ -298,6 +315,10 @@ export class Gateway {
       resetProtection: !!ctx.authority.resetProtection,
       freshUntil: ctx.freshUntil ?? null,
       authToken: ctx.authority.headHash ?? "in-process",
+      // Hashes removed within the cooldown window, refreshed by sweepAccount before
+      // each brain.sweep (the sweep that consumes this runs on the same serialized
+      // chain, so the set is fresh). The brain skips re-proposing them.
+      recentlyKilled: ctx.cooledHashes ?? null,
     };
   }
 
@@ -376,6 +397,28 @@ export class Gateway {
       if (ctx.floodUntil && this._clock() < ctx.floodUntil) {
         return { listed: 0, proposed: 0, removed: 0, skipped: "flood-backoff", sessions: [], evicted: [] };
       }
+      // COOLDOWN ORACLE: load the device_evicted hashes for this account within the
+      // lookback window from the durable eviction_log, BEFORE the sweep, so the brain
+      // (which reads recentlyKilled via _buildPolicyView on this same serial chain)
+      // does not re-evict a ghost we already removed. Fail-OPEN: any error yields an
+      // empty set, so the worst case is one duplicate row, never a missed eviction.
+      const nowMs = this._clock();
+      const cooled = new Set();
+      const evictCount = new Map(); // hash -> device_evicted rows seen in the window
+      try {
+        const rows = await this._d.recentlyEvicted?.({
+          linkId: ctx.linkId,
+          cutoffIso: new Date(nowMs - ORACLE_WINDOW_MS).toISOString(),
+        });
+        for (const r of rows ?? []) {
+          const h = String(r.hash);
+          evictCount.set(h, Number(r.count ?? 0));
+          if (nowMs - Number(r.lastAt ?? 0) < EVICT_COOLDOWN_MS) cooled.add(h);
+        }
+      } catch (e) {
+        this._d.logger?.(`recentlyEvicted oracle failed for ${ctx.linkId}: ${e.message}`);
+      }
+      ctx.cooledHashes = cooled;
       let result;
       try {
         result = await ctx.brain.sweep(handle);
@@ -393,10 +436,20 @@ export class Gateway {
         return { ...result, skipped: "flood-backoff" };
       }
       ctx.floodUntil = null; // clear only an expired/stale prior backoff
-      // Post-eviction roster = the listed roster minus what we just removed.
+      // Post-eviction roster = the listed roster minus what we just removed AND minus
+      // any cooled-down ghost the brain deliberately skipped this sweep. Treating a
+      // cooled-still-listed hash as "handled" keeps it out of the roster baseline
+      // (sessions -> lastRoster) exactly like a fresh eviction. Without this, a skipped
+      // ghost would re-enter lastRoster and be misread as a NEW arrival (login_new) now
+      // and as "signed out elsewhere" when Telegram finally GCs it.
       const evictedHashes = new Set((result.evicted ?? []).map((e) => String(e.hash)));
-      const sessions = evictedHashes.size > 0
-        ? (result.sessions ?? []).filter((s) => !evictedHashes.has(String(s.hash)))
+      const handled = new Set(evictedHashes);
+      for (const s of result.sessions ?? []) {
+        const h = String(s.hash);
+        if (cooled.has(h)) handled.add(h);
+      }
+      const sessions = handled.size > 0
+        ? (result.sessions ?? []).filter((s) => !handled.has(String(s.hash)))
         : (result.sessions ?? []);
 
       // ── activity events (collected, then recorded OUTSIDE the publish try/catch) ──
@@ -409,7 +462,7 @@ export class Gateway {
         const curByHash = new Map(sessions.map((s) => [String(s.hash), s]));
         const prevByHash = new Map(ctx.lastRoster.map((s) => [String(s.hash), s]));
         for (const [hash, p] of prevByHash) {
-          if (!curByHash.has(hash) && !evictedHashes.has(hash)) {
+          if (!curByHash.has(hash) && !handled.has(hash)) {
             events.push({ kind: "session_terminated_elsewhere", hash, deviceModel: p.deviceModel ?? null, country: p.country ?? null, detail: { device: p.deviceModel ?? p.appName ?? null, country: p.country ?? null } });
           }
         }
@@ -437,9 +490,17 @@ export class Gateway {
       // alias the prior-sweep baseline the arrivals/departures diff compares against.
       ctx.lastRoster = sessions.map((s) => ({ ...s }));
 
-      // device_evicted (one per removed session).
+      // device_evicted (one per removed session). With the cooldown gate above, a
+      // ghost yields exactly one row per window instead of one per ~7s sweep.
       for (const row of result.evicted ?? []) {
         events.push({ kind: "device_evicted", hash: String(row.hash), deviceModel: row.deviceModel ?? null, ip: row.ip ?? null, country: row.country ?? null, detail: { device: row.deviceModel ?? row.appName ?? null, country: row.country ?? null } });
+        // ESCALATION: a hash we have had to remove ESCALATE_K times within the lookback
+        // window is not a normal ghost (those GC within one window). Surface it to the
+        // operator log; protection continues (we keep removing it). +1 counts this sweep.
+        const prior = evictCount.get(String(row.hash)) ?? 0;
+        if (prior + 1 >= ESCALATE_K) {
+          this._d.logger?.(`[${handle}] PERSISTENT eviction: hash ${row.hash} removed ${prior + 1}x within ${Math.round(ORACLE_WINDOW_MS / 60000)}m — Telegram may be delaying termination; account still guarded`);
+        }
       }
 
       // eviction_rate_capped (H4): the brain capped a mass-eviction; alert once/burst.

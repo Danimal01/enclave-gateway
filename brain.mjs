@@ -63,8 +63,21 @@ export class Brain {
     // session not on the signed whitelist and not the guard's own," ordered
     // most-recent-first so a live intruder is removed first. Richer scoring or
     // anomaly classification plugs in here.
+    //
+    // COOLDOWN: also skip any hash we already removed within the cooldown window
+    // (view.recentlyKilled, supplied by the gateway from the eviction_log). After a
+    // successful resetAuthorization Telegram can keep LISTING the terminated session
+    // as a ghost for minutes; without this we re-evict + re-log + re-email it every
+    // sweep until Telegram GCs it (the eviction-loop incident). Keyed on the Telegram
+    // per-session hash, so a real new login (always a NEW hash) is never suppressed —
+    // it is not in recentlyKilled and is evicted immediately. A hash whose cooldown
+    // has expired drops out of recentlyKilled and falls back into candidates here, so
+    // a genuinely persistent session is still re-removed (at most once per window).
+    const recentlyKilled = view.recentlyKilled;
     const candidates = sessions
-      .filter((s) => !s.current && !view.whitelist.has(String(s.hash)))
+      .filter((s) => !s.current
+        && !view.whitelist.has(String(s.hash))
+        && !(recentlyKilled && recentlyKilled.has(String(s.hash))))
       .sort((a, b) => Number(b.dateActive ?? 0) - Number(a.dateActive ?? 0));
 
     if (fresh) {
