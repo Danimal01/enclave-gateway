@@ -47,7 +47,7 @@ nitro-cli describe-eif --eif-path gateway.eif   # -> PCR0
 Build twice and confirm the PCR0 matches. The expected value is:
 
 ```
-PCR0 = 8534213ebbcf7495ccadbc4c64d0476b8a4916fbfff469f6cb40d1dc02be8357b4f701c0c70a43a3810fd5674f2e5c13
+PCR0 = 9c53c4718ccefb7fb0085267eac72f1238d6f859931e590c9b83bdbb5dbd471b58f5f4f368bdcf7d03563cc128777e4d
 ```
 
 This is the same `pcr0_g` in `RELEASE.json` and the value the live AWS-signed

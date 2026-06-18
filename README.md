@@ -12,7 +12,7 @@ What it *can* do — watch for new logins, remove a session that is not on your
 signed keep-list, decline a hostile 2FA-password reset, and surface those events
 to you — is the entire surface, enumerated in one file you can audit.
 
-> **Current live release: `v1.0.5` — enclave fingerprint PCR0 `8534213ebbcf7495ccadbc4c64d0476b8a4916fbfff469f6cb40d1dc02be8357b4f701c0c70a43a3810fd5674f2e5c13`** (2026-06-17).
+> **Current live release: `v1.0.6` — enclave fingerprint PCR0 `9c53c4718ccefb7fb0085267eac72f1238d6f859931e590c9b83bdbb5dbd471b58f5f4f368bdcf7d03563cc128777e4d`** (2026-06-17).
 > **`RELEASE.json` is the single authoritative, machine-readable record of this build.** Only the fingerprint shown here is live. If you encounter any other PCR0 — in an older commit message, an old tag, or a cached page — it is a *superseded* release, not the current one. When in doubt, read `RELEASE.json` and the raw source files directly, not rendered or cached views.
 
 ## Why this exists (the problem the off-the-shelf stack can't solve)
@@ -59,6 +59,15 @@ authorization is consumed by a paired `importAuthorization` on the new DC connec
 inside the same enclave and never leaves enclave memory, so they cannot be used to hand
 your session to another party.
 
+**On `updates.getDifference`** (added in `v1.0.6` for real-time detection): the new-login
+alert (`UpdateNewAuthorization`) carries no `pts`/`qts` and is push-only, so to deliver it in
+real time the client keeps Telegram's update stream healthy and re-syncs it after a gap with
+`updates.getDifference`. Its reply *can* include message updates (`newMessages` /
+`newEncryptedMessages`), but the reader is **single-branch**: it processes only `otherUpdates`
+(login and session events) and discards the message arrays unread. There is no `messages.*`
+method on the allowlist; this is the only call whose reply could surface message data, and it
+is read *past*, not *into*.
+
 ## The guarantee, stated honestly
 
 This is a **bounded-surface** guarantee backed by readable source plus hardware
@@ -93,7 +102,7 @@ you see here. `RELEASE.json` is the authoritative record of the current build; t
 commit and tag it names simply timestamp exactly this source in the public history.
 
 ```
-PCR0_G = 8534213ebbcf7495ccadbc4c64d0476b8a4916fbfff469f6cb40d1dc02be8357b4f701c0c70a43a3810fd5674f2e5c13
+PCR0_G = 9c53c4718ccefb7fb0085267eac72f1238d6f859931e590c9b83bdbb5dbd471b58f5f4f368bdcf7d03563cc128777e4d
 ```
 
 Verify it yourself:
@@ -106,16 +115,16 @@ Verify it yourself:
    (The raw document is at `https://sessions.fyi/attestation/gateway.json` for your own
    COSE/Nitro verifier chaining to AWS Nitro Root G1.)
 2. **Check the capability file.** `sha256sum tg-chokepoint.mjs` →
-   `523899749491033fe20d17dbfb80cf600f2f72932fb7653c0b4da08df3084412` (= `RELEASE.json`
+   `18a17758a60fa1f9ec31e63ac1b9beaed7a87bd4601b0cc2cb6de21c31923f66` (= `RELEASE.json`
    `files[].sha256`).
    > **Two hashes on purpose — this is NOT a mismatch.** `files[].sha256` is the plain
-   > `sha256sum`. The top-level `allowlist_sha256` (`733d2164…`) is a *different,
+   > `sha256sum`. The top-level `allowlist_sha256` (`3e7ebadb…`) is a *different,
    > intentional* value: the attestation-binding digest over the preimage
    > `// FILE tg-chokepoint.mjs\n` + the file bytes. They are **not supposed to be equal** —
    > each is simply what a different verifier (a shell vs the attestation) computes over
    > the same file.
 3. **Rebuild it.** Follow `BUILD.md`; the PCR0 you get must equal the value above
-   (`a39e217d…8bb80e6a`) — the same value `RELEASE.json` and the live attestation report.
+   (`9c53c471…128777e4d`) — the same value `RELEASE.json` and the live attestation report.
 
 ## License
 
