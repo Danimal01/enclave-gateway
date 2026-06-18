@@ -21,7 +21,7 @@
   "reproducible_note": "umask-independent: a 644 and a 664 source context build the IDENTICAL PCR0 (the Dockerfile canonicalizes every COPYed file's mode; .gitattributes pins LF). The three host-staged binaries above are pinned by sha256 so a verifier can confirm them. Build on any host and match.",
   "transparency": "To verify: check out tag v1.0.7 of THIS repository, rebuild per BUILD.md, and confirm the PCR0 matches pcr0_g. The tag is the exact source that builds to pcr0_g.",
   "attestation": {
-    "live_artifact": "https://sessions.fyi/attestation/gateway.json",
+    "live_artifact": "https://jmxqeylkftqmkmvoorhi.supabase.co/storage/v1/object/public/attestation/gateway.json",
     "verifier": "https://sessions.fyi/how-it-works",
     "note": "A live AWS Nitro enclave running this exact image attests PCR0_G above (the live artifact is authoritative for the current module id and timestamp). The capability allowlist (tg-chokepoint.mjs) is account-management only: no message, chat, file, or contact method. The one call whose reply can carry message updates, updates.getDifference, is read single-branch (only otherUpdates) and its newMessages are discarded unread."
   },

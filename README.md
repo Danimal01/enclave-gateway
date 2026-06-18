@@ -112,7 +112,7 @@ Verify it yourself:
    decodes the COSE document, validates the certificate chain to the **AWS Nitro
    Enclaves Root G1**, extracts PCR0, and checks it equals the published value — all
    client-side, no server of ours involved. It shows green only if every link holds.
-   (The raw document is at `https://sessions.fyi/attestation/gateway.json` for your own
+   (The raw document is at `https://jmxqeylkftqmkmvoorhi.supabase.co/storage/v1/object/public/attestation/gateway.json` for your own
    COSE/Nitro verifier chaining to AWS Nitro Root G1.)
 2. **Check the capability file.** `sha256sum tg-chokepoint.mjs` →
    `18a17758a60fa1f9ec31e63ac1b9beaed7a87bd4601b0cc2cb6de21c31923f66` (= `RELEASE.json`

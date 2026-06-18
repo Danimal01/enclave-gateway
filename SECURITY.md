@@ -55,4 +55,4 @@ is a known limitation we intend to address.
 - That the published source reproduces to the published PCR0: `BUILD.md`.
 - That a live AWS-signed attestation reports that PCR0: the in-browser verifier at
   https://sessions.fyi/how-it-works, or run your own COSE/Nitro verifier against
-  https://sessions.fyi/attestation/gateway.json.
+  https://jmxqeylkftqmkmvoorhi.supabase.co/storage/v1/object/public/attestation/gateway.json.
