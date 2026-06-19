@@ -7,6 +7,7 @@ reports, or the "this exact code is running" claim visibly fails in public.
 ## Pins
 
 - Base image: `public.ecr.aws/amazonlinux/amazonlinux@sha256:df9ca26898d7c01be79e7c84bd008d5c8c867ace2c736421d150179f0aa87c33`
+- OS packages: `dnf --releasever=2023.12.20260608` (a frozen Amazon Linux 2023 snapshot). The base image is digest-pinned, but `dnf install` otherwise resolves against AL's rolling "latest" repo, so the toolchain is pinned to this snapshot to keep the compiled native modules and `attest` binary (both measured into PCR0) byte-deterministic over time. Verified: this snapshot rebuilds to the published PCR0_G byte-for-byte.
 - Node dependencies: `package-lock.json` (installed with `npm ci`)
 - `SOURCE_DATE_EPOCH=1577836800`, arch `aarch64` (AWS Graviton)
 

@@ -11,7 +11,12 @@
 #   sudo env DOCKER_BUILDKIT=1 SOURCE_DATE_EPOCH=1577836800 docker build --no-cache -t sessions-gateway:repro .
 #   sudo env TMPDIR=~/btmp nitro-cli build-enclave --docker-uri sessions-gateway:repro --output-file gateway.eif
 FROM public.ecr.aws/amazonlinux/amazonlinux@sha256:df9ca26898d7c01be79e7c84bd008d5c8c867ace2c736421d150179f0aa87c33 AS builder
-RUN dnf install -y nodejs npm python3 make gcc gcc-c++ && dnf clean all
+# Pin dnf to a frozen AL2023 snapshot so the toolchain (and thus the compiled
+# native modules + attest binary baked into PCR0) is byte-deterministic. Without
+# this, `dnf install` resolves against Amazon Linux's rolling "latest" repo, so a
+# rebuild months from now would drift to a different PCR0 -- breaking "rebuild and
+# match" silently. This snapshot reproduces the published PCR0_G byte-for-byte.
+RUN dnf --releasever=2023.12.20260608 install -y nodejs npm python3 make gcc gcc-c++ && dnf clean all
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund \
@@ -25,7 +30,8 @@ COPY libnsm.so /usr/lib64/libnsm.so
 RUN gcc -O2 -o /attest /build/attest.c -L/usr/lib64 -lnsm
 
 FROM public.ecr.aws/amazonlinux/amazonlinux@sha256:df9ca26898d7c01be79e7c84bd008d5c8c867ace2c736421d150179f0aa87c33
-RUN dnf install -y nodejs socat iproute ca-certificates findutils && dnf clean all
+# Same frozen AL2023 snapshot as the builder stage (see note above).
+RUN dnf --releasever=2023.12.20260608 install -y nodejs socat iproute ca-certificates findutils && dnf clean all
 WORKDIR /app
 COPY --from=builder /app/node_modules ./node_modules
 # The published gateway source. Each file is rendered verbatim on the capability
