@@ -636,6 +636,104 @@ export class Gateway {
     }
   }
 
+  // Propagate post-arm signed policy changes (allow-reset/protect-reset,
+  // set-whitelist, set-threshold, add-key, remove-key) into the running enclave.
+  // The web appends a signed vN+1 to policy_envelopes, but the State Authority head
+  // is only set to v1 at arm, so adopt()'s anchor filter ignores everything past
+  // v1. This walks the SA head forward to the verified chain head -- the missing
+  // call to the deployed-but-never-used compare_and_advance -- then swaps
+  // ctx.authority so the op gate + _buildPolicyView + brain enforce the new policy.
+  // Mirrors reconcileDisconnect's fail-closed re-verify-then-act shape exactly and
+  // is capability-neutral (no tg-chokepoint/allowlist change). Fail-safe: a
+  // forged/unsigned row anywhere -> !ok -> no SA write, ctx.authority untouched; any
+  // transient error -> keep last-good, retry next sweep; every CAS carries the live
+  // holder/gen fence so a stale enclave loses cleanly (never a fence, never a wipe).
+  async reconcilePolicy(handle) {
+    const pre = this._accts.get(handle);
+    if (!pre) return null;
+    const { authorityClient, policyStore, verifierCfg } = this._d;
+
+    // Cheap pre-check OUTSIDE the per-account lock (mirror reconcileDisconnect):
+    // act only when the fresh signed chain head is newer than what we enforce.
+    let rows;
+    try { rows = await policyStore(pre.linkId); }
+    catch (e) { this._d.logger?.(`policy: read failed for ${pre.linkId}: ${e.message}`); return null; }
+    const ordered = [...(rows ?? [])].sort((a, b) => a.version - b.version);
+    const head = ordered[ordered.length - 1];
+    if (!head) return null;
+    if (String(head.action) === "disconnect") return null;            // reconcileDisconnect owns the disconnect head
+    if (head.version <= (pre.authority?.headVersion ?? 1)) return null; // steady-state no-op, zero SA traffic
+
+    return this._runSerial(pre, async () => {
+      // Re-fetch the LIVE ctx inside the lock: a concurrent recover can swap it.
+      const ctx = this._accts.get(handle);
+      if (!ctx) return null;
+
+      let rec;
+      try { rec = await authorityClient.read(ctx.stateId); }
+      catch (e) { this._d.logger?.(`policy: SA read failed for ${ctx.linkId}: ${e.message}`); return null; }
+      if (rec.phase !== "ARMED") return null; // TERMINAL/ONBOARDING are not ours to advance
+
+      // SINGLE full-chain re-verify anchored at the real head. deriveAuthority walks
+      // v1..head verifying every row against its predecessor, so this one derive
+      // proves EVERY intermediate valid: a forged/unsigned/out-of-quorum row
+      // anywhere makes the whole thing !ok and we advance nothing.
+      const headHash = payloadHash(String(head.action), head.core);
+      const verified = await deriveAuthority(rows, {
+        linkId: ctx.linkId, tgUserId: ctx.tgUserId, signersCommit: ctx.row.signers_commit,
+        now: this._d.now ?? (() => Date.now()), ...verifierCfg,
+      }, { version: head.version, hash: headHash });
+      if (!verified.ok) { this._d.logger?.(`policy REFUSED for ${ctx.linkId}: ${verified.reason}`); return null; }
+
+      // Step-walk the SA head forward, one CAS per intermediate (compare_and_advance
+      // requires nextVersion strictly > expected AND exact prior-head match). Assign
+      // ctx.authority in LOCKSTEP after each CAS so the SA head and the enforced
+      // authority never diverge -- a crash mid-walk re-adopts cleanly at the reached
+      // intermediate (every step is a user-signed valid state).
+      const byV = new Map(ordered.map((r) => [r.version, r]));
+      let curV = rec.policy_version, curH = rec.policy_head_hash;
+      while (curV < head.version) {
+        const next = byV.get(curV + 1);
+        if (!next) { this._d.logger?.(`policy: chain gap at v${curV + 1} for ${ctx.linkId}`); return { advanced: curV }; }
+        if (String(next.action) === "disconnect") return { advanced: curV }; // defer the disconnect head to reconcileDisconnect
+        const nextHash = payloadHash(String(next.action), next.core);
+        if (next.core_hash && next.core_hash !== nextHash) {                  // belt-and-suspenders: stored hash must match
+          this._d.logger?.(`policy: core_hash mismatch at v${next.version} for ${ctx.linkId}`); return { advanced: curV };
+        }
+        try {
+          await authorityClient.compareAndAdvance(ctx.stateId, ctx.holder, ctx.gen, curV, curH, next.version, nextHash);
+        } catch (e) {
+          // CAS miss = stale epoch / raced advance / lease handoff -> TRANSIENT.
+          // Keep last-good, retry next sweep. NEVER a fence.
+          this._d.logger?.(`policy: CAS ${ctx.linkId} v${curV}->v${next.version} failed: ${e.message}`);
+          return { advanced: curV };
+        }
+        // Lockstep authority swap to this verified intermediate (already proven ok by
+        // `verified` above). Compute-then-assign: ctx.authority is never partial/null,
+        // so _buildPolicyView never transiently returns watch-only/null.
+        const stepDerived = await deriveAuthority(ordered.filter((r) => r.version <= next.version), {
+          linkId: ctx.linkId, tgUserId: ctx.tgUserId, signersCommit: ctx.row.signers_commit,
+          now: this._d.now ?? (() => Date.now()), ...verifierCfg,
+        }, { version: next.version, hash: nextHash });
+        if (!stepDerived.ok) { this._d.logger?.(`policy: step re-derive !ok at v${next.version} for ${ctx.linkId}`); return { advanced: curV }; }
+        ctx.authority = stepDerived.authority;
+        this._d.logger?.(`policy: advanced ${ctx.linkId} -> v${next.version} (${String(next.action)})`);
+        curV = next.version; curH = nextHash;
+      }
+      return { advanced: curV };
+    });
+  }
+
+  // Poll-driven by gateway-main every sweep, after reconcileDisconnectsAll and
+  // before sweepAll: bring each adopted account's enforced authority up to its
+  // latest signed policy. A no-op once converged.
+  async reconcilePolicyAll() {
+    for (const handle of [...this._accts.keys()]) {
+      try { await this.reconcilePolicy(handle); }
+      catch (e) { this._d.logger?.(`policy reconcile error: ${e.message}`); }
+    }
+  }
+
   async checkSecurityAll() {
     for (const handle of [...this._accts.keys()]) {
       const ctx = this._accts.get(handle);
