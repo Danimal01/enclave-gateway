@@ -326,32 +326,19 @@ export class Gateway {
   async _onNewAuth(handle, evt) {
     const ctx = this._accts.get(handle);
     if (!ctx) return; // no account context at all -> nothing to attribute the event to
-    // Record a login_new ONLY for a hash that is, right now, a REAL non-current,
-    // non-whitelisted session. Telegram reports the guard's OWN session as hash 0, so
-    // the push's real hash never matches a present non-current session -- this stops the
-    // guard flagging its own onboarding login (or a transient setup authorization) as a
-    // scary "new login from an unknown device". A genuine intruder's hash IS present,
-    // non-current and unwhitelisted, so it is still recorded instantly. Fail-OPEN if the
-    // roster can't be confirmed (flood/transient): record anyway so a real alert is never
-    // dropped -- this gates on the ROSTER, not brain-readiness, so the C1 adoption-window
-    // push is not lost.
-    // Record a login_new UNLESS we can POSITIVELY identify the hash as our own current
-    // session or a whitelisted one. Fail-OPEN on everything else -- including a roster that
-    // does not YET list the pushed hash (propagation lag must never drop a real alert; the
-    // prior `!!match && ...` form silently dropped exactly that case).
-    let suppress = false;
-    try {
-      const view = this._buildPolicyView(handle);
-      const { sessions } = await this._call(handle, "LIST_SESSIONS", {});
-      const match = (sessions ?? []).find((s) => String(s.hash) === String(evt.hash));
-      suppress = !!match && (!!match.current || !!view?.whitelist?.has(String(evt.hash)));
-    } catch { /* fail-open: record */ }
-    if (!suppress) {
-      await this._recordLoginNewOnce(ctx, evt.hash, {
-        hash: evt.hash, unconfirmed: !!evt.unconfirmed,
-        device: evt.device ?? null, location: evt.location ?? null,
-      });
-    }
+    // PARK-AND-MATCH (restores the prior worker behavior the gateway rewrite dropped).
+    // A push carries a session's REAL hash. Telegram REPLAYS the guard's OWN login push on
+    // reconnect (getDifference), and the roster reports our own session as current/hash-0 --
+    // so a pushed hash can NEVER be matched to our self row, and logging it inline
+    // false-flags the guard's own enrollment as a scary "new login from an unknown device".
+    // Instead we PARK the hash; the sweep's resolver (below) logs it ONLY once the roster
+    // confirms it as a real (current:false, non-whitelisted) session, tagged with that
+    // row's real device. Our own session is current and NEVER appears as a non-current row,
+    // so the self-replay is never logged; a genuine intruder appears as a non-current row
+    // and IS logged (including in the seed/adoption window -- the resolver runs before the
+    // seed-gate). Eviction is unchanged (roster-driven, gated on !current), so protection
+    // is unaffected; the push still triggers the immediate protective sweep below.
+    (ctx.pendingAuthPush ||= new Set()).add(String(evt.hash));
     // Protective sweep only once the brain is up (detection is best-effort).
     if (ctx.brain) {
       try { await this.sweepAccount(handle); }
@@ -454,6 +441,32 @@ export class Gateway {
 
       // ── activity events (collected, then recorded OUTSIDE the publish try/catch) ──
       const events = [];
+
+      // PARK-AND-MATCH RESOLVER: log hashes parked by _onNewAuth ONLY once the roster
+      // confirms them as real (current:false, non-whitelisted) sessions, tagged with the
+      // row's real device. Runs EVERY sweep INCLUDING the seed sweep (before the lastRoster
+      // gate below), so an intruder that logs in during the adoption window is caught on
+      // sweep #1. The guard's own session is current/hash-0 and never matches -> the
+      // self-replay is never logged. Uses the cooldown-filtered `sessions` so a cooled ghost
+      // is excluded; _recordLoginNewOnce dedups (shared with the arrivals backstop). A hash
+      // not yet in the roster (propagation lag) is dropped here and re-caught by the
+      // arrivals backstop on the sweep whose roster first lists it.
+      if (ctx.pendingAuthPush?.size) {
+        const pview = this._buildPolicyView(handle);
+        // Match against the FULL LISTED roster (result.sessions), NOT the post-eviction
+        // `sessions`, so a real new login that is EVICTED in this same sweep is still
+        // logged as login_new (then device_evicted) -- exactly what the old inline push
+        // did. Exclude current (self), whitelisted, and cooled ghosts (a prior eviction
+        // still listed); a freshly-evicted intruder is a genuine new login and IS logged.
+        const listed = new Map((result.sessions ?? []).map((s) => [String(s.hash), s]));
+        for (const h of ctx.pendingAuthPush) {
+          const s = listed.get(h);
+          if (s && !s.current && !pview?.whitelist?.has(h) && !cooled.has(h)) {
+            await this._recordLoginNewOnce(ctx, h, { device: s.deviceModel ?? s.appName ?? null, country: s.country ?? null });
+          }
+        }
+        ctx.pendingAuthPush.clear();
+      }
 
       // Roster diff (C3): the user removing a session elsewhere, or a session moving.
       // Seed on the first sweep (no events for a pre-existing roster); evictions are

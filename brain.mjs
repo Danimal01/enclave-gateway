@@ -76,6 +76,7 @@ export class Brain {
     const recentlyKilled = view.recentlyKilled;
     const candidates = sessions
       .filter((s) => !s.current
+        && String(s.hash) !== "0" // belt-and-suspenders: hash 0 is the guard's own session; !current already excludes it
         && !view.whitelist.has(String(s.hash))
         && !(recentlyKilled && recentlyKilled.has(String(s.hash))))
       .sort((a, b) => Number(b.dateActive ?? 0) - Number(a.dateActive ?? 0));

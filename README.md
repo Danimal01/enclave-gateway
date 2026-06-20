@@ -12,7 +12,7 @@ What it *can* do — watch for new logins, remove a session that is not on your
 signed keep-list, decline a hostile 2FA-password reset, and surface those events
 to you — is the entire surface, enumerated in one file you can audit.
 
-> **Current live release: `v1.0.9`, enclave fingerprint PCR0 `6522a6e04abe0b2dfca906cfe06038b20b080e524e061a3d19a1b0011afafae02e6fb870967acaa24c9abd00db879e38`** (`v1.0.9` propagates post-arm signed policy changes into the running enclave; capability-neutral, so the allowlist is byte-identical to `v1.0.8`).
+> **Current live release: `v1.0.10`, enclave fingerprint PCR0 `724a471e09d3bfa2b5127e35a23020bbeee9f848bd5bf405a8b7a620662babb6b11a41051d2e1a31585cda1bf1ea78d4`** (`v1.0.10` stops the guard from logging its own reconnect as a "new login"; capability-neutral, so the allowlist is byte-identical to `v1.0.9`).
 > **`RELEASE.json` is the single authoritative, machine-readable record of this build.** Only the fingerprint shown here is live. If you encounter any other PCR0 — in an older commit message, an old tag, or a cached page — it is a *superseded* release, not the current one. When in doubt, read `RELEASE.json` and the raw source files directly, not rendered or cached views.
 
 ## Why this exists (the problem the off-the-shelf stack can't solve)
@@ -103,7 +103,7 @@ reproduces the identical PCR0 you see here. `RELEASE.json` is the authoritative 
 commit and tag it names simply timestamp exactly this source in the public history.
 
 ```
-PCR0_G = 6522a6e04abe0b2dfca906cfe06038b20b080e524e061a3d19a1b0011afafae02e6fb870967acaa24c9abd00db879e38
+PCR0_G = 724a471e09d3bfa2b5127e35a23020bbeee9f848bd5bf405a8b7a620662babb6b11a41051d2e1a31585cda1bf1ea78d4
 ```
 
 Verify it yourself:
@@ -125,7 +125,7 @@ Verify it yourself:
    > each is simply what a different verifier (a shell vs the attestation) computes over
    > the same file.
 3. **Rebuild it.** Follow `BUILD.md`; the PCR0 you get must equal the value above
-   (`6522a6e0…b879e38`) the same value `RELEASE.json` and the live attestation report.
+   (`724a471e…1ea78d4`) the same value `RELEASE.json` and the live attestation report.
 
 ## License
 
