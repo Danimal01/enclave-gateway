@@ -12,7 +12,7 @@ What it *can* do — watch for new logins, remove a session that is not on your
 signed keep-list, decline a hostile 2FA-password reset, and surface those events
 to you — is the entire surface, enumerated in one file you can audit.
 
-> **Current live release: `v1.0.7` — enclave fingerprint PCR0 `18f0f9a3f86abca33bcfb220103e86174db0452171f91df9ecb6d82c47bba4d1fb88202832f68c237a4895a7b91ad10b`** (2026-06-18).
+> **Current live release: `v1.0.8` — enclave fingerprint PCR0 `18f0f9a3f86abca33bcfb220103e86174db0452171f91df9ecb6d82c47bba4d1fb88202832f68c237a4895a7b91ad10b`** (`v1.0.8` is a build-determinism pin of the same running image; the PCR0 is byte-identical to `v1.0.7`).
 > **`RELEASE.json` is the single authoritative, machine-readable record of this build.** Only the fingerprint shown here is live. If you encounter any other PCR0 — in an older commit message, an old tag, or a cached page — it is a *superseded* release, not the current one. When in doubt, read `RELEASE.json` and the raw source files directly, not rendered or cached views.
 
 ## Why this exists (the problem the off-the-shelf stack can't solve)
@@ -96,9 +96,10 @@ This is a **production** release: this exact image runs in a live AWS Nitro
 enclave guarding real Telegram accounts right now. It is not a development,
 staging, or testnet build. A genuine enclave running this image attests the
 measurement below, and the build is **umask-independent**: the Dockerfile
-canonicalizes every COPYed file's mode and mtime, so a `--no-cache` build on any
-host (any umask, any OS via the pinned LF checkout) reproduces the identical PCR0
-you see here. `RELEASE.json` is the authoritative record of the current build; the
+canonicalizes every COPYed file's mode and mtime, and pins the OS toolchain to a
+frozen Amazon Linux 2023 snapshot (so the compiled native modules don't drift),
+so a `--no-cache` build on any host (any umask, any OS via the pinned LF checkout)
+reproduces the identical PCR0 you see here. `RELEASE.json` is the authoritative record of the current build; the
 commit and tag it names simply timestamp exactly this source in the public history.
 
 ```
