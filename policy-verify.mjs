@@ -28,6 +28,7 @@ import { secp256k1 } from "@noble/curves/secp256k1.js";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 
 const RESET_WINDOW_MS = 8 * 24 * 60 * 60 * 1000;
+const ENROLL_WINDOW_MS = 30 * 60 * 1000; // MUST match lib/envelope.ts ENROLL_WINDOW_MS
 const ISSUED_FUTURE_SKEW_MS = 60 * 60 * 1000;
 
 const ACTION_LABELS = {
@@ -39,6 +40,11 @@ const ACTION_LABELS = {
   "add-key": "add a key",
   "remove-key": "remove a key",
   arm: "turn on your guard with this exact policy",
+  // MUST stay byte-identical to lib/proof.ts ACTION_LABELS (the wallet message is rebuilt
+  // from these and matched exactly on both the web and gateway sides).
+  "set-contest-protection": "change how your guard responds to a copied login",
+  "set-allow-ip-jumping": "allow a device to change its location",
+  "open-enroll": "open a short window to add a new device",
 };
 
 function canonicalWalletMessage(action, detailsHash, nonce) {
@@ -83,7 +89,11 @@ function validNewSigner(s) {
 }
 
 function sameExcept(action, prev, core, changed) {
-  for (const f of ["whitelist", "threshold", "reset_allowed_until", "signers"]) {
+  // HIGHEST-RISK HOLE if a field is omitted here: any signed delta (e.g. set-whitelist)
+  // could smuggle a contest_protection / allow_ip_jumping / enroll_until change under a
+  // signature meant for something else (arm/disarm the burn on a benign approval). Every
+  // policy field the gateway derives MUST be pinned-equal for actions that don't change it.
+  for (const f of ["whitelist", "threshold", "reset_allowed_until", "signers", "contest_protection", "allow_ip_jumping", "enroll_until"]) {
     if (changed.includes(f)) continue;
     if (!canonicalEq(prev[f], core[f])) return `${action} may not change ${f}, but it did`;
   }
@@ -116,6 +126,29 @@ export function verifyDelta(action, prev, core) {
     }
     case "disconnect":
       return sameExcept(action, prev, core, []);
+    case "set-contest-protection": {
+      const e = sameExcept(action, prev, core, ["contest_protection"]);
+      if (e) return e;
+      return ["off", "alert", "auto_burn"].includes(core.contest_protection)
+        ? null : "contest_protection must be off|alert|auto_burn";
+    }
+    case "set-allow-ip-jumping": {
+      const e = sameExcept(action, prev, core, ["allow_ip_jumping"]);
+      if (e) return e;
+      if (!Array.isArray(core.allow_ip_jumping) || core.allow_ip_jumping.length > 50) return "malformed allow_ip_jumping";
+      if (core.allow_ip_jumping.some((h) => typeof h !== "string" || h.length > 64)) return "malformed allow_ip_jumping entry";
+      return null;
+    }
+    case "open-enroll": {
+      const e = sameExcept(action, prev, core, ["enroll_until"]);
+      if (e) return e;
+      if (!core.enroll_until) return "open-enroll must set a non-null enroll window";
+      const until = new Date(core.enroll_until).getTime();
+      const issued = new Date(core.issued_at).getTime();
+      if (!Number.isFinite(until) || !Number.isFinite(issued)) return "open-enroll has malformed timestamps";
+      if (Math.abs(until - (issued + ENROLL_WINDOW_MS)) > 60_000) return "open-enroll window must be issued_at + 30 minutes";
+      return null;
+    }
     case "remove-key": {
       const e = sameExcept(action, prev, core, ["signers", "threshold"]);
       if (e) return e;
@@ -409,6 +442,14 @@ export async function deriveAuthority(rows, cfg, anchor) {
       resetProtection: c.reset_allowed_until === null || c.reset_allowed_until === undefined,
       resetAllowedUntil: c.reset_allowed_until ?? null,
       disconnected: String(head.action) === "disconnect",
+      // tdata-replay (P2). Read ONLY from the signed core (deriveAuthority), never from a
+      // brain/ctx/arg field. D2: absent contest_protection reads as "alert" (a NON-burn
+      // value) so a pre-v0 policy never silently arms auto_burn. The per-row head-hash
+      // anchor (payloadHash over the whole core) already covers these, so a State-Authority
+      // rollback that resurrects an old value fails closed.
+      contestProtection: c.contest_protection ?? "alert",
+      allowIpJumping: Array.isArray(c.allow_ip_jumping) ? c.allow_ip_jumping.map(String) : [],
+      enrollUntil: c.enroll_until ?? null,
       headVersion: head.version,
       headHash,
     },
@@ -429,13 +470,28 @@ export function assertOpAllowed(authority, op, arg = {}) {
   }
   switch (op) {
     case "EVICT_SESSION": {
-      const wl = new Set((authority.whitelist ?? []).map(String));
-      if (wl.has(String(arg.hash))) return { ok: false, reason: "hash is on the signed whitelist (kept session)" };
+      // Refuse current FIRST, unconditionally: the guard's own session is NEVER burnable,
+      // not even under a contest override (absolute, gameplan §5).
       const roster = arg.freshRoster;
       if (!Array.isArray(roster)) return { ok: false, reason: "evict requires a fresh roster taken in the same op (M-1)" };
       const inRoster = roster.find((s) => String(s.hash) === String(arg.hash));
       if (!inRoster) return { ok: false, reason: "hash not present in the fresh roster" };
       if (inRoster.current) return { ok: false, reason: "refusing to evict the current (guard's own) session" };
+      const wl = new Set((authority.whitelist ?? []).map(String));
+      if (wl.has(String(arg.hash))) {
+        // A whitelisted hash is normally KEPT. The ONE exception is a tdata replay riding
+        // the victim's own whitelisted desktop: burn iff the SIGNED contest-protection is
+        // auto_burn AND the brain requested the override for this op. The ENABLE is read
+        // ONLY from `authority` (signed, via deriveAuthority); arg.contestOverride is merely
+        // a request to USE it. If the enable were ever sourced from arg/ctx/a brain field, a
+        // compromised brain could burn any kept hash (the M-of-N RLS lesson). D4: this is
+        // === "auto_burn" exactly (NOT !== "off", which would wrongly burn in alert mode).
+        const burnEnabled = authority.contestProtection === "auto_burn";
+        if (!(arg.contestOverride === true && burnEnabled)) {
+          return { ok: false, reason: "hash is on the signed whitelist (kept session)" };
+        }
+        // permitted: signed contest-protection authorizes a whitelist-burn override
+      }
       return { ok: true };
     }
     case "DECLINE_RESET":

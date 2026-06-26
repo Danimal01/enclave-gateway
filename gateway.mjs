@@ -19,6 +19,7 @@ import { MODES } from "./tg-chokepoint.mjs";
 import { deriveAuthority, assertOpAllowed, payloadHash } from "./policy-verify.mjs";
 import { decodeRequest, encodeResponse, encodeEvent } from "./brain-protocol.mjs";
 import { Brain } from "./brain.mjs";
+import { makeGeoState } from "./replay-detect.mjs";
 
 // EVICTION COOLDOWN (eviction-loop incident, 2026-06-18). After a successful
 // account.resetAuthorization, Telegram can keep LISTING the terminated session as a
@@ -36,6 +37,14 @@ import { Brain } from "./brain.mjs";
 const EVICT_COOLDOWN_MS = Number(process.env.EVICT_COOLDOWN_MS ?? 1_800_000); // 30 min
 const ESCALATE_K = 4;
 const ORACLE_WINDOW_MS = EVICT_COOLDOWN_MS * ESCALATE_K; // lookback for the dedup oracle
+// Replay detection (P1): how long a tier>=2 verdict arms fast-poll (P4 consumes
+// ctx.fastUntil), how long to suppress a duplicate replay_suspected row for the same
+// hash (the email pipeline also dedups at 120s, but the activity feed needs this so a
+// 2s fast-poll does not write a row every poll), and how many consecutive torn reads
+// before we log a degraded signal (never silently blind).
+const FAST_MODE_MS = 60_000;
+const REPLAY_ALERT_COOLDOWN_MS = 30 * 60_000; // 30 min per hash
+const BAD_ROSTER_DEGRADE_N = 3;
 
 // FLOOD_WAIT detection. GramJS rewrites FloodWaitError's `.message` to a human
 // sentence ("A wait of N seconds is required ...") but keeps the wait on
@@ -88,6 +97,8 @@ const EVENT_REASON = {
   device_evicted: "Removed a session that was not on the signed keep-list",
   session_terminated_elsewhere: "A session was signed out elsewhere",
   session_location_changed: "A session changed location",
+  replay_suspected: "A kept session is being used from a new place (possible copied login)",
+  contested_session_burned: "Revoked a kept session that showed signs of being copied",
   twofa_enabled: "Two-step verification was turned on",
   twofa_disabled: "Two-step verification was turned off",
   reset_requested: "A 2FA-password reset was requested",
@@ -182,7 +193,18 @@ export class Gateway {
         downSince: null,       // monotonic ts the account first went unhealthy (for honest degraded reporting)
         selfHealing: false,    // re-entrancy guard while recoverAccount is rebuilding this account
         degradedAlerted: false,// one-shot guard for a future guard_degraded event
+        // Replay-detection geo state (ring + learned baseline + teleport streak). MUST
+        // survive selfFence->re-adopt: re-adopt builds a fresh ctx with no geo, so a fence
+        // mid-attack would re-seed the attacker's city as the legit home (gameplan §4).
+        // We therefore stash it OUTSIDE ctx, keyed by handle, and re-attach on re-adopt;
+        // selfFence deletes ctx but never the stashed geo. recoverAccount mutates ctx in
+        // place, so geo is naturally preserved there.
+        geo: ((this._geoByHandle ??= new Map()).get(handle)) ?? makeGeoState(),
+        badRosterStreak: 0,    // consecutive torn (no-current) roster reads
+        replayAlerted: new Map(), // hash -> ms until which a duplicate replay_suspected is suppressed
+        fastUntil: null,       // ms until which fast-poll is armed (set on a replay suspicion; P4 consumes)
       };
+      this._geoByHandle.set(handle, ctx.geo);
       this._accts.set(handle, ctx);
       this._byState.set(row.state_id, handle);
       ctx.brain = new Brain({
@@ -230,7 +252,12 @@ export class Gateway {
         return await ctx.tx.readSecurityState();
       case "EVICT_SESSION": {
         const freshRoster = await ctx.tx.listSessions();
-        const gate = assertOpAllowed(ctx.authority, "EVICT_SESSION", { hash: req.arg.hash, freshRoster });
+        // contestOverride is a REQUEST to use the signed contest-protection; the gate reads
+        // the ENABLE only from ctx.authority (signed). A whitelisted hash burns only when
+        // BOTH are true. The chokepoint re-bind below (exact-hash) is unchanged.
+        const gate = assertOpAllowed(ctx.authority, "EVICT_SESSION", {
+          hash: req.arg.hash, freshRoster, contestOverride: req.arg.contestOverride === true,
+        });
         if (!gate.ok) throw new Error(`evict refused: ${gate.reason}`);
         // Re-bind the chokepoint's evict gate to THIS exact, policy-approved hash.
         const removed = await ctx.tx.evictSession(req.arg.hash, {
@@ -279,6 +306,14 @@ export class Gateway {
       const wait = floodWaitSeconds(e);
       if (wait != null) {
         ctx.floodUntil = this._clock() + wait * 1000;
+        // 2-strike breaker (P4): fast-polling at ~2s is the likely cause of a FLOOD_WAIT,
+        // so a second consecutive flood exits fast-mode and falls back to the baseline
+        // cadence (the backoff above already suppresses all MTProto until it elapses).
+        ctx.floodStrikes = (ctx.floodStrikes ?? 0) + 1;
+        if (ctx.floodStrikes >= 2 && ctx.fastUntil) {
+          ctx.fastUntil = null;
+          this._d.logger?.(`[${handle}] 2 consecutive FLOOD_WAITs — exiting fast-mode, falling back to baseline cadence`);
+        }
         this._d.logger?.(`[${handle}] flood-wait ${wait}s — backing off MTProto`);
       }
       throw e;
@@ -319,6 +354,19 @@ export class Gateway {
       // each brain.sweep (the sweep that consumes this runs on the same serialized
       // chain, so the set is fresh). The brain skips re-proposing them.
       recentlyKilled: ctx.cooledHashes ?? null,
+      // Replay-detection geo state, passed BY REFERENCE: classifyReplay (run inside
+      // brain.sweep) mutates this same object so the ring/baseline persist across sweeps.
+      geo: ctx.geo ?? null,
+      // tdata-replay signed policy (P2), surfaced from the SIGNED authority only. The brain
+      // uses contestProtection to decide whether to request a contested burn (P3) and
+      // enrollUntil to HOLD a new arrival during an operator enrollment window (D11).
+      contestProtection: ctx.authority.contestProtection ?? "alert",
+      allowIpJumping: ctx.authority.allowIpJumping ?? [],
+      enrollUntil: ctx.authority.enrollUntil ?? null,
+      // No-2FA degradation input (P3): true/false once the security check has read the
+      // account, undefined before. The brain burns unless this is POSITIVELY false (a
+      // forced re-login the attacker can also pass without 2FA is not protection).
+      has2fa: ctx.security ? !!ctx.security.has_2fa : undefined,
     };
   }
 
@@ -423,6 +471,7 @@ export class Gateway {
         return { ...result, skipped: "flood-backoff" };
       }
       ctx.floodUntil = null; // clear only an expired/stale prior backoff
+      ctx.floodStrikes = 0;  // a clean round-trip resets the 2-strike fast-mode breaker
       // Post-eviction roster = the listed roster minus what we just removed AND minus
       // any cooled-down ghost the brain deliberately skipped this sweep. Treating a
       // cooled-still-listed hash as "handled" keeps it out of the roster baseline
@@ -438,6 +487,29 @@ export class Gateway {
       const sessions = handled.size > 0
         ? (result.sessions ?? []).filter((s) => !handled.has(String(s.hash)))
         : (result.sessions ?? []);
+
+      // ROSTER-SANITY (fail SAFE): the brain already retried a torn read once. If it is
+      // STILL torn (no current:true row), do NOT diff, emit, classify, or re-baseline
+      // from it -- a torn read once logged the iPhone + the guard's own hash-0 as
+      // "signed out elsewhere". Hold lastRoster + geo at their last good values (never
+      // skip-OPEN) and log a degraded signal after N consecutive bad reads (the guard is
+      // never silently blind). The brain returned rosterTorn before classifying, so
+      // result.replayVerdicts is empty here too.
+      if (result.rosterTorn) {
+        ctx.badRosterStreak = (ctx.badRosterStreak ?? 0) + 1;
+        if (ctx.badRosterStreak >= BAD_ROSTER_DEGRADE_N && !ctx.rosterDegradedAlerted) {
+          ctx.rosterDegradedAlerted = true;
+          this._d.logger?.(`[${handle}] DEGRADED: ${ctx.badRosterStreak} consecutive torn roster reads — guarding on the last good roster, retrying`);
+        }
+        return result;
+      }
+      ctx.badRosterStreak = 0;
+      ctx.rosterDegradedAlerted = false;
+
+      // Replay verdicts from classifyReplay (run inside brain.sweep on this same roster).
+      // tier>=2 hashes are handled by replay_suspected below; suppress the benign
+      // session_location_changed notice for them so the same move is not double-logged.
+      const verdictByHash = new Map((result.replayVerdicts ?? []).map((v) => [String(v.hash), v]));
 
       // ── activity events (collected, then recorded OUTSIDE the publish try/catch) ──
       const events = [];
@@ -482,6 +554,11 @@ export class Gateway {
         for (const [hash, cu] of curByHash) {
           const p = prevByHash.get(hash);
           if (p && (String(cu.country ?? "") !== String(p.country ?? "") || String(cu.region ?? "") !== String(p.region ?? ""))) {
+            // TIER GATE: a tier>=2 verdict (suspected/confirmed replay) for this hash is
+            // surfaced as replay_suspected below; do not ALSO log it as a benign
+            // "session changed location" (double-log + wrong severity).
+            const vd = verdictByHash.get(String(hash));
+            if (vd && vd.tier >= 2) continue;
             // Dashboard renders detail.device + detail.country (the NEW location).
             events.push({ kind: "session_location_changed", hash, deviceModel: cu.deviceModel ?? null, country: cu.country ?? null, detail: { device: cu.deviceModel ?? cu.appName ?? null, country: cu.country ?? null, from: p.country ?? null } });
           }
@@ -503,9 +580,53 @@ export class Gateway {
       // alias the prior-sweep baseline the arrivals/departures diff compares against.
       ctx.lastRoster = sessions.map((s) => ({ ...s }));
 
-      // device_evicted (one per removed session). With the cooldown gate above, a
-      // ghost yields exactly one row per window instead of one per ~7s sweep.
+      // REPLAY SUSPECTED (P1 alert; P3 will add the contested burn). A tier>=2 verdict
+      // means a kept/existing hash teleported outside its learned baseline or is flapping
+      // between countries -- the fingerprint of a tdata replay riding the victim's own
+      // session. Arm fast-poll on every suspicion, but emit at most one replay_suspected
+      // row per hash per cooldown (a 2s fast-poll would otherwise write a row every poll;
+      // the email pipeline separately dedups the detect+burn pair at 120s). The detect row
+      // MUST NOT set device_model -- an eviction_log row with device_model inflates the
+      // "Evicted" hero + threatCount (gameplan §8 trap #2); the device goes in detail only.
+      for (const vd of result.replayVerdicts ?? []) {
+        if (vd.tier < 2) continue;
+        ctx.fastUntil = this._clock() + FAST_MODE_MS;
+        const until = ctx.replayAlerted?.get(String(vd.hash)) ?? 0;
+        if (this._clock() < until) continue;
+        ctx.replayAlerted?.set(String(vd.hash), this._clock() + REPLAY_ALERT_COOLDOWN_MS);
+        const cur = (result.sessions ?? []).find((s) => String(s.hash) === String(vd.hash));
+        const fromHome = vd.signals?.teleport?.baseline?.[0] ?? null;
+        events.push({
+          kind: "replay_suspected", hash: String(vd.hash), country: vd.locality ?? null,
+          detail: { device: cur?.deviceModel ?? cur?.appName ?? null, country: vd.locality ?? null, from: fromHome, trigger: vd.trigger },
+        });
+      }
+
+      // device_evicted / contested_session_burned (one per removed session). With the
+      // cooldown gate above, a ghost yields exactly one row per window, not one per sweep.
       for (const row of result.evicted ?? []) {
+        if (row.contested) {
+          // The BURN row: it MUST set device_model (the "Evicted" hero + the device-card
+          // "please reconnect" text source after the whitelisted row vanishes from the
+          // roster, gameplan §8 trap #1). The detect row (replay_suspected) does NOT.
+          events.push({
+            kind: "contested_session_burned", hash: String(row.hash),
+            deviceModel: row.deviceModel ?? row.appName ?? null, ip: row.ip ?? null, country: row.locality ?? row.country ?? null,
+            detail: { device: row.deviceModel ?? row.appName ?? null, country: row.locality ?? row.country ?? null, trigger: row.trigger ?? "replay" },
+          });
+          // The burned whitelisted row VANISHES from session_snapshots on the next publish
+          // (trap #1), so the dashboard banner + device-card "please reconnect" must source
+          // from guard_state.notes.contested, NOT the gone session row. Published below via
+          // the notes merge (jsonb ||), so it persists across later roster-only publishes.
+          ctx.contested = {
+            hash: String(row.hash),
+            city: row.locality ?? row.country ?? null,
+            device: row.deviceModel ?? row.appName ?? null,
+            trigger: row.trigger ?? "replay",
+            at: new Date(this._clock()).toISOString(),
+          };
+          continue;
+        }
         events.push({ kind: "device_evicted", hash: String(row.hash), deviceModel: row.deviceModel ?? null, ip: row.ip ?? null, country: row.country ?? null, detail: { device: row.deviceModel ?? row.appName ?? null, country: row.country ?? null } });
         // ESCALATION: a hash we have had to remove ESCALATE_K times within the lookback
         // window is not a normal ghost (those GC within one window). Surface it to the
@@ -521,9 +642,13 @@ export class Gateway {
       // genuine flood being whittled down. Without the removed>0 guard this misfired
       // during the 24h fresh window (removed:0 but pending = every detected session), so
       // a single held login rendered a bogus "removing N, 3 at a time" alert.
-      if ((result.removed ?? 0) > 0 && (result.pending ?? 0) > 0 && (!ctx.massEvictUntil || this._clock() >= ctx.massEvictUntil)) {
+      // A contested burn is a single targeted action, never a "flood being whittled," so it
+      // is excluded from the rate-cap signal (it would otherwise misfire during the fresh/
+      // enroll hold, where the MVP batch is held but a contested burn still ran).
+      const mvpRemoved = (result.removed ?? 0) - (result.contestedRemoved ?? 0);
+      if (mvpRemoved > 0 && (result.pending ?? 0) > 0 && (!ctx.massEvictUntil || this._clock() >= ctx.massEvictUntil)) {
         ctx.massEvictUntil = this._clock() + 3600000;
-        events.push({ kind: "eviction_rate_capped", detail: { total: (result.pending ?? 0) + (result.removed ?? 0), perSweep: 3 } });
+        events.push({ kind: "eviction_rate_capped", detail: { total: (result.pending ?? 0) + mvpRemoved, perSweep: 3 } });
       } else if ((result.pending ?? 0) === 0) {
         ctx.massEvictUntil = null;
       }
@@ -534,8 +659,23 @@ export class Gateway {
       // 2FA/reset/recovery/TTL state the 5-min check maintains.
       const sig = rosterSignature(sessions);
       const rosterChanged = sessions.length > 0 && (result.removed > 0 || sig !== ctx.lastPublishSig);
+      // AUTO-CLEAR the contested banner once the user has RECONNECTED: a whitelisted,
+      // non-current session that logged in AFTER the burn means their own device is back and
+      // kept, so the "sign back in" alert has done its job. Without this the enclave would
+      // re-publish the stale contested note forever (it lives in ctx.contested in memory),
+      // and clearing the DB row never sticks because the next roster-change publish re-adds it.
+      if (ctx.contested) {
+        const wl = this._buildPolicyView(handle)?.whitelist;
+        const burnMs = Date.parse(ctx.contested.at) || 0;
+        const reconnected = (sessions ?? []).some((s) => !s.current && String(s.hash) !== "0"
+          && wl?.has?.(String(s.hash)) && s.dateCreated && Number(s.dateCreated) * 1000 > burnMs);
+        if (reconnected) ctx.contested = null;
+      }
       try {
-        await this._d.publishState?.({ linkId: ctx.linkId, sessions: rosterChanged ? sessions : null, status: "active", notes: { ...(ctx.security ?? {}) } });
+        // Publish the contested key AUTHORITATIVELY (the value while active, null otherwise),
+        // so the ENCLAVE owns the banner state and a stale DB row can never linger. The jsonb
+        // merge sets the key to null on clear, which the dashboard reads as "no banner".
+        await this._d.publishState?.({ linkId: ctx.linkId, sessions: rosterChanged ? sessions : null, status: "active", notes: { ...(ctx.security ?? {}), contested: ctx.contested ?? null } });
         if (rosterChanged) ctx.lastPublishSig = sig;
       } catch (e) {
         this._d.logger?.(`state publish failed for ${ctx.linkId}: ${e.message}`);
@@ -552,10 +692,23 @@ export class Gateway {
     return this._runSerial(ctx, run);
   }
 
-  // Periodic poll: sweep + reset-protection check across every adopted account.
-  async sweepAll() {
+  // Periodic poll: sweep across every adopted account. Two timers drive this (P4 adaptive
+  // cadence): the baseline ~7s timer calls sweepAll() with no opts (sweeps everyone, exactly
+  // as before), and a ~2s fast timer calls sweepAll({ fastOnly:true, minGapMs }) which sweeps
+  // ONLY accounts currently in a replay fast-window (ctx.fastUntil). A per-account min-gap
+  // skips an account swept moments ago by the other timer, so a hot account polls at ~2s and
+  // a cold one stays at ~7s, with no account starved. Default (no opts) is unchanged, so
+  // direct sweepAccount() callers and tests see identical behavior.
+  async sweepAll(opts = {}) {
+    const fastOnly = opts.fastOnly === true;
+    const minGap = Number(opts.minGapMs ?? 0);
+    const now = this._clock();
     const out = [];
     for (const handle of [...this._accts.keys()]) {
+      const ctx = this._accts.get(handle);
+      if (fastOnly && !(ctx?.fastUntil && now < ctx.fastUntil)) continue; // not hot -> the baseline timer covers it
+      if (minGap > 0 && ctx && now - (ctx.lastSweptAt ?? 0) < minGap) continue; // swept too recently
+      if (ctx) ctx.lastSweptAt = now;
       try { out.push({ handle, sweep: await this.sweepAccount(handle) }); }
       catch (e) { out.push({ handle, error: e.message }); }
     }

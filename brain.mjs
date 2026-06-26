@@ -19,6 +19,8 @@
 // later becomes worth hiding from attackers, it splits back onto its own host
 // with no logic rewrite.
 
+import { classifyReplay } from "./replay-detect.mjs";
+
 export const DEFAULTS = Object.freeze({
   MAX_EVICT_PER_SWEEP: 3,
   FRESH_WINDOW_MS: 24 * 60 * 60 * 1000,
@@ -56,8 +58,47 @@ export class Brain {
       return { listed: 0, proposed: 0, removed: 0, skipped: "no-policy-view", sessions: [], evicted: [] };
     }
 
-    const { sessions } = await this._gw.call("LIST_SESSIONS", {});
+    let { sessions } = await this._gw.call("LIST_SESSIONS", {});
+
+    // ROSTER-SANITY GATE (fail SAFE). account.getAuthorizations never throws; a torn
+    // read returns a short/empty list with no current:true row. Acting on one fired a
+    // real false positive (danimaled 2026-06-25: the iPhone + the guard's own hash-0
+    // logged as "signed out elsewhere" from a single torn read). Retry ONCE on the same
+    // connection; we never classify, evict, or re-baseline from a roster that has no
+    // current session. On a still-torn read we return rosterTorn so the gateway skips
+    // the diff/emit + lastRoster/geo updates (never skip-OPEN, which would fail unsafe).
+    let rosterTorn = false;
+    if (!sessions.some((s) => s.current)) {
+      const retry = await this._gw.call("LIST_SESSIONS", {}).catch(() => null);
+      if (retry?.sessions?.some((s) => s.current)) sessions = retry.sessions;
+      else rosterTorn = true;
+    }
+    if (rosterTorn) {
+      this._log(`[${acct}] torn roster (no current session) — watch-only this sweep`);
+      return { listed: sessions.length, proposed: 0, removed: 0, skipped: "roster-torn", rosterTorn: true, sessions, evicted: [], replayVerdicts: [] };
+    }
+
+    // REPLAY DETECTION. Classify the EXISTING/whitelisted hashes by their movement
+    // BEFORE the candidate filter below: a tdata replay rides the victim's own
+    // whitelisted desktop hash, so the whitelist check at :candidate-filter would drop
+    // it and it would never be classified. classifyReplay mutates view.geo (== ctx.geo
+    // by reference) and returns verdicts; the gateway turns tier>=2 into replay_suspected
+    // + fast-poll. (P3 will turn a tier-3 verdict into a contested burn here.)
+    let replayVerdicts = [];
+    if (view.geo) {
+      try { replayVerdicts = classifyReplay(sessions, view.geo, this._now(), this._p.detect); }
+      catch (e) { this._log(`[${acct}] classifyReplay failed: ${e.message}`); }
+    }
+
     const fresh = view.freshUntil && this._now() < view.freshUntil;
+    // ENROLLMENT HOLD (D11): while a SIGNED, auto-expiring enroll window is open, HOLD the
+    // MVP eviction batch so a newly-logged-in device survives long enough for the operator
+    // to whitelist its LIVE hash (re-login would mint a different one). The window rides the
+    // signed authority (enroll_until), so a tdata/console path can never open it. Contested
+    // flap/teleport burns still run (P3) -- the hold is for the benign add-a-device flow,
+    // not a blanket amnesty. Detection/alerting above already ran (never hold-gated).
+    const enrollUntilMs = view.enrollUntil ? Date.parse(view.enrollUntil) : 0;
+    const enrollHold = Number.isFinite(enrollUntilMs) && this._now() < enrollUntilMs;
 
     // The detection decision: which sessions to act on. The MVP rule is "any
     // session not on the signed whitelist and not the guard's own," ordered
@@ -74,40 +115,86 @@ export class Brain {
     // has expired drops out of recentlyKilled and falls back into candidates here, so
     // a genuinely persistent session is still re-removed (at most once per window).
     const recentlyKilled = view.recentlyKilled;
-    const candidates = sessions
+    const candidatesAll = sessions
       .filter((s) => !s.current
         && String(s.hash) !== "0" // belt-and-suspenders: hash 0 is the guard's own session; !current already excludes it
         && !view.whitelist.has(String(s.hash))
         && !(recentlyKilled && recentlyKilled.has(String(s.hash))))
       .sort((a, b) => Number(b.dateActive ?? 0) - Number(a.dateActive ?? 0));
 
-    if (fresh) {
-      this._log(`[${acct}] fresh window active — proposing no evictions`);
-      return { listed: sessions.length, proposed: 0, removed: 0, skipped: "fresh-window", pending: candidates.length, sessions, evicted: [] };
+    // CONTESTED BURNS (P3). A tier-3 replay verdict (flap/teleport) marks an EXISTING hash,
+    // usually the victim's OWN whitelisted desktop, as a tdata replay. Burn it with
+    // contestOverride:true, which the gateway permits ONLY under the signed auto_burn policy
+    // (D4) -- the ENABLE is never sourced here, only the request. These run REGARDLESS of the
+    // fresh/enroll hold (a replay is not benign setup; D8: flap/teleport ignore the fresh
+    // window). NEVER current (the gate refuses it absolutely anyway). NO-2FA DEGRADATION:
+    // a forced re-login the attacker can also pass is not protection, so we burn unless 2FA
+    // is POSITIVELY known to be off; the replay_suspected alert already fired regardless.
+    const has2fa = view.has2fa !== false;
+    const burnEnabled = view.contestProtection === "auto_burn" && has2fa;
+    const tier3 = new Map((replayVerdicts ?? []).filter((v) => v.tier === 3).map((v) => [String(v.hash), v]));
+    if (tier3.size > 0 && view.contestProtection === "auto_burn" && !has2fa) {
+      this._log(`[${acct}] contested replay detected but the account has no 2FA — degraded to alert (no burn)`);
+    }
+    const contestedBurns = burnEnabled
+      ? [...tier3.keys()]
+          .map((h) => sessions.find((s) => String(s.hash) === h))
+          .filter((s) => s && !s.current && String(s.hash) !== "0"
+            && !(recentlyKilled && recentlyKilled.has(String(s.hash))))
+      : [];
+    const contestedSet = new Set(contestedBurns.map((s) => String(s.hash)));
+
+    // Dedup BEFORE the slice: a contested hash never also runs through the MVP batch (it
+    // carries the override; the MVP path would refuse it as whitelisted anyway).
+    const mvpCandidates = candidatesAll.filter((s) => !contestedSet.has(String(s.hash)));
+    const holding = fresh || enrollHold;
+
+    // One shared MAX_EVICT_PER_SWEEP budget: contested burns take priority, then the MVP
+    // batch fills the remainder. The MVP batch is suppressed entirely during the fresh/enroll
+    // hold; contested burns are not.
+    const cap = this._p.MAX_EVICT_PER_SWEEP;
+    const plan = [];
+    for (const s of contestedBurns) { if (plan.length >= cap) break; plan.push({ s, contested: true }); }
+    if (!holding) {
+      for (const s of mvpCandidates) { if (plan.length >= cap) break; plan.push({ s, contested: false }); }
     }
 
-    // Rate cap: never fire a thundering mass-eviction in one sweep; whittle a
-    // flood down over successive sweeps.
-    const batch = candidates.slice(0, this._p.MAX_EVICT_PER_SWEEP);
     let removed = 0;
+    let contestedRemoved = 0;
     const evicted = [];
-    for (const s of batch) {
+    for (const { s, contested } of plan) {
       try {
-        const body = await this._gw.call("EVICT_SESSION", { hash: String(s.hash), authorized: view.authToken });
+        const arg = { hash: String(s.hash), authorized: view.authToken };
+        if (contested) arg.contestOverride = true;
+        const body = await this._gw.call("EVICT_SESSION", arg);
         if (body.removed) {
           removed += 1;
-          evicted.push(s);
+          if (contested) {
+            contestedRemoved += 1;
+            const v = tier3.get(String(s.hash));
+            // Tag the row so the gateway emits contested_session_burned (with device_model),
+            // not device_evicted, and sources the "please reconnect" text from the burn row.
+            evicted.push({ ...s, contested: true, trigger: v?.trigger ?? "replay", locality: v?.locality ?? s.country ?? null });
+          } else {
+            evicted.push(s);
+          }
         }
       } catch (e) {
-        // The gateway refused (e.g. the session was on the signed whitelist after
-        // all, or became current). The detection proposing is not authority; a
-        // refusal is expected and logged, never fatal.
-        this._log(`[${acct}] evict ${s.hash} refused by gateway: ${e.message}`);
+        // The gateway refused (e.g. became current, or auto_burn not signed). Proposing is
+        // not authority; a refusal is expected and logged, never fatal.
+        this._log(`[${acct}] evict ${s.hash}${contested ? " (contested)" : ""} refused by gateway: ${e.message}`);
       }
     }
+
+    const mvpProposed = plan.filter((p) => !p.contested).length;
     return {
-      listed: sessions.length, proposed: batch.length, removed,
-      pending: Math.max(0, candidates.length - batch.length), sessions, evicted,
+      listed: sessions.length,
+      proposed: plan.length,
+      removed,
+      contestedRemoved, // excluded from eviction_rate_capped (a contested burn is not a flood)
+      pending: holding ? mvpCandidates.length : Math.max(0, mvpCandidates.length - mvpProposed),
+      sessions, evicted, replayVerdicts,
+      skipped: holding ? (enrollHold ? "enroll-hold" : "fresh-window") : undefined,
     };
   }
 
