@@ -12,7 +12,7 @@ What it *can* do — watch for new logins, remove a session that is not on your
 signed keep-list, decline a hostile 2FA-password reset, and surface those events
 to you — is the entire surface, enumerated in one file you can audit.
 
-> **Current live release: `v1.0.11`, enclave fingerprint PCR0 `8bd012fe223fb1725f796d30636a0829732d6076d4301d38e6f329f7f449c5e5bc6ca8c851ea8f8ae18cadd34f3f8598`** (`v1.0.11` adds tdata-replay session-clone detection and revocation; capability-neutral, so the allowlist is byte-identical to `v1.0.10`).
+> **Current live release: `v1.1.0`, enclave fingerprint PCR0 `dd20cf5f109b04ac7437ed458f9b47d1ed2baab5157656feeda860ea53a9e2ead8b2a1d635767d06df33ef6bb4fef347`** (`v1.1.0` is tdata-replay detection v2: platform-aware and identity-anchored Tier A/B/C revocation, a signed trusted-locations allowlist, and in-band recovery; capability-neutral, so the allowlist is byte-identical to `v1.0.11`).
 > **`RELEASE.json` is the single authoritative, machine-readable record of this build.** Only the fingerprint shown here is live. If you encounter any other PCR0 — in an older commit message, an old tag, or a cached page — it is a *superseded* release, not the current one. When in doubt, read `RELEASE.json` and the raw source files directly, not rendered or cached views.
 
 ## Why this exists (the problem the off-the-shelf stack can't solve)
@@ -103,7 +103,7 @@ reproduces the identical PCR0 you see here. `RELEASE.json` is the authoritative 
 commit and tag it names simply timestamp exactly this source in the public history.
 
 ```
-PCR0_G = 8bd012fe223fb1725f796d30636a0829732d6076d4301d38e6f329f7f449c5e5bc6ca8c851ea8f8ae18cadd34f3f8598
+PCR0_G = dd20cf5f109b04ac7437ed458f9b47d1ed2baab5157656feeda860ea53a9e2ead8b2a1d635767d06df33ef6bb4fef347
 ```
 
 Verify it yourself:
@@ -125,7 +125,7 @@ Verify it yourself:
    > each is simply what a different verifier (a shell vs the attestation) computes over
    > the same file.
 3. **Rebuild it.** Follow `BUILD.md`; the PCR0 you get must equal the value above
-   (`8bd012fe…f3f8598`) the same value `RELEASE.json` and the live attestation report.
+   (`dd20cf5f…4fef347`) the same value `RELEASE.json` and the live attestation report.
 
 ## License
 

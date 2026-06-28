@@ -99,6 +99,9 @@ const EVENT_REASON = {
   session_location_changed: "A session changed location",
   replay_suspected: "A kept session is being used from a new place (possible copied login)",
   contested_session_burned: "Revoked a kept session that showed signs of being copied",
+  replay_burned: "Revoked a copied login that teleported to a place you have not trusted",
+  flap_burned: "Revoked a login being used from two places at once",
+  geo_alert: "A kept mobile session became active from a new place (watch only, not removed)",
   twofa_enabled: "Two-step verification was turned on",
   twofa_disabled: "Two-step verification was turned off",
   reset_requested: "A 2FA-password reset was requested",
@@ -361,8 +364,13 @@ export class Gateway {
       // uses contestProtection to decide whether to request a contested burn (P3) and
       // enrollUntil to HOLD a new arrival during an operator enrollment window (D11).
       contestProtection: ctx.authority.contestProtection ?? "alert",
-      allowIpJumping: ctx.authority.allowIpJumping ?? [],
+      allowIpJumping: ctx.authority.allowIpJumping ?? [], // DEPRECATED (v2): superseded by localityAllowlist
       enrollUntil: ctx.authority.enrollUntil ?? null,
+      // tdata-replay v2 (P3): the signed trusted-locations allowlist + travel-mode toggle. The
+      // brain resolves the ACTIVE set (permanent always; time-boxed only when travelMode is on
+      // and unexpired) and passes it to classifyReplay to suppress Tier C silently (never A/B).
+      localityAllowlist: ctx.authority.localityAllowlist ?? [],
+      travelMode: !!ctx.authority.travelMode,
       // No-2FA degradation input (P3): true/false once the security check has read the
       // account, undefined before. The brain burns unless this is POSITIVELY false (a
       // forced re-login the attacker can also pass without 2FA is not protection).
@@ -596,8 +604,12 @@ export class Gateway {
         ctx.replayAlerted?.set(String(vd.hash), this._clock() + REPLAY_ALERT_COOLDOWN_MS);
         const cur = (result.sessions ?? []).find((s) => String(s.hash) === String(vd.hash));
         const fromHome = vd.signals?.teleport?.baseline?.[0] ?? null;
+        // A MOBILE same-fingerprint teleport (Tier C) is alert-only by design (never auto-burned);
+        // surface it as geo_alert, NOT replay_suspected, so the copy is honest and it is clearly a
+        // watch event. Like the detect row, it sets NO device_model (it inflates the Evicted count).
+        const alertKind = vd.platform === "mobile" && vd.tierClass === "C" ? "geo_alert" : "replay_suspected";
         events.push({
-          kind: "replay_suspected", hash: String(vd.hash), country: vd.locality ?? null,
+          kind: alertKind, hash: String(vd.hash), country: vd.locality ?? null,
           detail: { device: cur?.deviceModel ?? cur?.appName ?? null, country: vd.locality ?? null, from: fromHome, trigger: vd.trigger },
         });
       }
@@ -609,8 +621,13 @@ export class Gateway {
           // The BURN row: it MUST set device_model (the "Evicted" hero + the device-card
           // "please reconnect" text source after the whitelisted row vanishes from the
           // roster, gameplan §8 trap #1). The detect row (replay_suspected) does NOT.
+          // v2 granular burn kind by trigger: a concurrent two-place flap -> flap_burned, a
+          // teleport / identity-change copied login -> replay_burned. Both are real removals, so
+          // both MUST set device_model (the Evicted hero + the "please reconnect" source). The
+          // legacy contested_session_burned stays defined for old rows + back-compat.
+          const burnKind = row.trigger === "flap" || row.tierClass === "A" ? "flap_burned" : "replay_burned";
           events.push({
-            kind: "contested_session_burned", hash: String(row.hash),
+            kind: burnKind, hash: String(row.hash),
             deviceModel: row.deviceModel ?? row.appName ?? null, ip: row.ip ?? null, country: row.locality ?? row.country ?? null,
             detail: { device: row.deviceModel ?? row.appName ?? null, country: row.locality ?? row.country ?? null, trigger: row.trigger ?? "replay" },
           });

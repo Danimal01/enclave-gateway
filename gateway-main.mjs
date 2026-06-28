@@ -297,6 +297,9 @@ function dbSessionRows(sessions) {
     region: s.region ?? null,
     date_created: s.dateCreated ?? null,
     date_active: s.dateActive ?? null,
+    api_id: s.apiId ?? null,
+    official_app: s.officialApp ?? null,
+    app_version: s.appVersion ?? null,
     is_current: !!s.current,
   }));
 }
@@ -370,7 +373,7 @@ export async function main() {
         // hash that Telegram still ghosts must not be re-burned every sweep. The detector's
         // liveness gate already blocks re-firing on a dead ghost, but this is belt+braces
         // and keeps recentlyKilled honest for the contested batch in brain.sweep.
-        .in("kind", ["device_evicted", "contested_session_burned"])
+        .in("kind", ["device_evicted", "contested_session_burned", "replay_burned", "flap_burned"])
         .gt("evicted_at", cutoffIso);
       if (error || !Array.isArray(data)) return [];
       const byHash = new Map();

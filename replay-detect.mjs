@@ -44,14 +44,64 @@ export function countryOf(locality) {
   return (i === -1 ? locality : locality.slice(i + 1)).trim();
 }
 
+// The client-IDENTITY tuple (spec v2 §4 Tier B). A change in ANY of these four
+// fields means a DIFFERENT machine/client is driving the auth_key. system_version /
+// app_version are DELIBERATELY EXCLUDED (a benign OS/app update bumps them and can
+// coincide with travel) -- versions are advisory only, never a burn trigger.
+export function fingerprintOf(s) {
+  return {
+    deviceModel: s.deviceModel ?? null,
+    platform: s.platform ?? null,
+    apiId: s.apiId ?? null,
+    officialApp: s.officialApp ?? null,
+  };
+}
+
+// True if the LIVE identity differs from the ENROLLED identity in any of the four
+// fields. Anchored to the enrolled fingerprint, never the prior poll: a desktop hash
+// that starts reporting platform=iOS is an identity change (the anti-dodge, §4 / §8.2),
+// not a new normal. Only fields the enrolled baseline actually captured are compared
+// (a null enrolled field never manufactures a change from a transient null read).
+export function identityChanged(enrolled, current) {
+  if (!enrolled) return false; // no baseline captured yet -> cannot be a change
+  for (const k of ["deviceModel", "platform", "apiId", "officialApp"]) {
+    const e = enrolled[k] ?? null;
+    const c = current[k] ?? null;
+    if (e != null && c != null && String(e) !== String(c)) return true;
+  }
+  return false;
+}
+
+// Route a Telegram `platform` string to the policy class that decides Tier C handling
+// (desktop = burn on untrusted teleport; mobile = alert only). Real clients always
+// report a platform; an unknown/blank value routes to DESKTOP by decision (the
+// documented tdata threat surface; matches v1 which burned all teleports).
+export function platformClass(platform) {
+  return /android|ios|iphone|ipad/i.test(String(platform ?? "")) ? "mobile" : "desktop";
+}
+
 export function makeGeoState() {
   return {
     // hash -> [{ locality, country, deviceModel, dateActive, at, live }] (most recent last)
     ring: new Map(),
-    // hash -> { homeKeys:Set<locality>, knownDevices:Set<device>, bornAt:number, seeded:boolean }
+    // hash -> { homeKeys:Set<locality>, knownDevices:Set<device>, bornAt:number,
+    //           seeded:boolean, enrolledFp:{deviceModel,platform,apiId,officialApp},
+    //           enrolledPlatform:"desktop"|"mobile" }
+    // enrolledFp/enrolledPlatform are captured ONCE at first-sight and never overwritten
+    // (the §6 invariant: identity policy follows the ENROLLED value, never the live poll).
     baseline: new Map(),
     // hash -> { locality, count } consecutive out-of-baseline LIVE observations
     pendingTeleport: new Map(),
+    // Recovery / re-seed window flag (§5.2, §6). When the gateway sets this true (during
+    // a baseline rebuild / recovery), classifyReplay still seeds + rings but CAPS every
+    // verdict at alert (tier 2) so a baseline freshly (re)built mid-attack can never burn
+    // before the operator/recovery flow corrects it. Set BY REFERENCE on the geoState the
+    // gateway owns; survives the selfFence stash with the rest of geoState. Default off.
+    // NOTE (intentionally inert today): no production path sets this true yet. The baseline
+    // survives selfFence (stashed in _geoByHandle), so a fence does NOT re-seed, and recovery
+    // re-enroll mints a NEW hash seeded at the real re-login city. This is a ready seam for a
+    // future explicit re-baseline path; arm it (ctx.geo.reseedHold = true) when one lands.
+    reseedHold: false,
   };
 }
 
@@ -84,9 +134,17 @@ function flapStats(entries, now, p) {
 // classifyReplay(sessions, geoState, now, params) -> ReplayVerdict[]
 //
 // ReplayVerdict = {
-//   hash, tier: 1|2|3, trigger: "advisory"|"flap"|"teleport",
-//   locality, signals: { live, flap?, teleport?, deviceChanged? }
+//   hash, tier: 1|2|3, tierClass: "A"|"B"|"C" (omitted for advisory),
+//   trigger: "advisory"|"flap"|"teleport", locality,
+//   platform: "desktop"|"mobile" (the ENROLLED routing class; set on flap/teleport),
+//   signals: { live, identityChanged?, deviceChanged?, crossCountry?, fastPath?, flap?, teleport? }
 // }
+//
+// The §4 ladder (precedence A > B > C): Tier A = flap (always burns, both platforms);
+// Tier B = teleport WITH a client-IDENTITY change (burns both platforms, first poll);
+// Tier C = same-identity teleport (the ambiguous geo case). The detector reports the tier
+// + the ENROLLED platform; the burn/allowlist ROUTING lives in the gate (P3): desktop
+// Tier C burns, mobile Tier C alerts, and the signed allowlist relaxes ONLY Tier C.
 //
 // Side effect: mutates geoState (ring/baseline/pendingTeleport). Prunes state for
 // hashes no longer in the roster. Returns one verdict per hash that changed location
@@ -94,6 +152,15 @@ function flapStats(entries, now, p) {
 export function classifyReplay(sessions, geoState, now, params = {}) {
   const p = { ...DETECT_DEFAULTS, ...params };
   const { ring, baseline, pendingTeleport } = geoState;
+  // Recovery / re-seed window (§5.2/§6): cap every verdict at alert (tier 2) so a baseline
+  // (re)built mid-attack can never burn before the operator/recovery flow corrects it.
+  const reseedHold = !!geoState.reseedHold;
+  const cap = (tier) => (reseedHold ? Math.min(tier, 2) : tier);
+  // The ACTIVE signed trusted-locations allowlist (v2 §4), resolved by the brain (permanent
+  // entries always; time-boxed only while travel_mode is on and unexpired). A Set of strings,
+  // each a whole-country wildcard ("United States") or a precise "City, Country". Relaxes ONLY
+  // Tier C; Tier A (flap) and Tier B (identity change) never consult it.
+  const activeAllowlist = p.activeAllowlist instanceof Set ? p.activeAllowlist : null;
   const verdicts = [];
   const seenHashes = new Set();
 
@@ -108,70 +175,96 @@ export function classifyReplay(sessions, geoState, now, params = {}) {
     const country = countryOf(locality);
     const live = isLive(s.dateActive, now, p.LIVE_WINDOW_MS);
     const device = s.deviceModel ?? null;
+    const fp = fingerprintOf(s);
 
     const hist = ring.get(hash);
     const prevEntry = hist && hist.length ? hist[hist.length - 1] : null;
     const prevLocality = prevEntry ? prevEntry.locality : null;
 
-    // First time we have ever seen this hash: SEED its baseline (its current home)
-    // and record it. Never classify on the seeding observation (that is just learning
-    // the home, D9), so a freshly-enrolled device never self-flags.
+    // First time we have ever seen this hash: SEED its baseline (its current home AND its
+    // enrolled client-identity) and record it. Never classify on the seeding observation
+    // (that is just learning the home, D9), so a freshly-enrolled device never self-flags.
+    // enrolledFp/enrolledPlatform are captured ONCE here and never overwritten (§6).
     if (!baseline.has(hash)) {
       baseline.set(hash, {
         homeKeys: new Set(locality ? [locality] : []),
         knownDevices: new Set(device ? [device] : []),
         bornAt: now,
         seeded: true,
+        enrolledFp: fp,
+        enrolledPlatform: platformClass(fp.platform),
       });
       pushRing(ring, hash, { locality, country, deviceModel: device, dateActive: s.dateActive ?? null, at: now, live }, p);
       continue;
     }
 
     const base = baseline.get(hash);
+    // Back-compat fill for a baseline seeded by a pre-v2 build (no enrolledFp): capture it
+    // from the current row ONCE. This is a fill of a missing value, never a re-seed of an
+    // existing one (which would violate §6's enrolled-identity invariant).
+    if (!base.enrolledFp) { base.enrolledFp = fp; base.enrolledPlatform = platformClass(fp.platform); }
+    const platform = base.enrolledPlatform;
     const inBaseline = locality != null && base.homeKeys.has(locality);
-    // deviceChanged is a CORROBORATOR ONLY (never a standalone trigger): true when the
-    // current device model is not one we have seen for this hash before this poll
-    // (computed against the ring BEFORE we record the current device below).
+    // IDENTITY change vs the ENROLLED fingerprint (Tier B): a different machine/client is
+    // driving the key (device_model / platform / api_id / official_app). deviceChanged
+    // (device_model vs the ring) is kept as an advisory corroborator signal only.
+    const idChanged = identityChanged(base.enrolledFp, fp);
     const corroboratedDeviceChange = device != null && !prevEntryDeviceSeen(hist, device);
     base.knownDevices.add(device ?? "");
 
     // Push the observation BEFORE running flap (flap reads the ring including now).
     pushRing(ring, hash, { locality, country, deviceModel: device, dateActive: s.dateActive ?? null, at: now, live }, p);
 
-    // TRIGGER A — FLAP (D7): country oscillation across >= MIN_DISTINCT_COUNTRIES
-    // within W_FLAP, both poles provably live. ALWAYS T3 (no toggle relaxes it, no
-    // fresh-window suppression). No benign single-hash instance exists.
+    // TIER A — FLAP (D7): country oscillation across >= MIN_DISTINCT_COUNTRIES within
+    // W_FLAP, both poles provably live. Burns BOTH platforms; no toggle/allowlist relaxes
+    // it, no fresh-window suppression. No benign single-hash instance exists.
     const fs = flapStats(ring.get(hash), now, p);
     if (live && fs.transitions >= p.MIN_TRANSITIONS && fs.countries.length >= p.MIN_DISTINCT_COUNTRIES) {
       pendingTeleport.delete(hash);
       verdicts.push({
-        hash, tier: 3, trigger: "flap", locality,
-        signals: { live, deviceChanged: corroboratedDeviceChange, flap: { transitions: fs.transitions, countries: fs.countries, windowMs: p.W_FLAP_MS } },
+        hash, tier: cap(3), tierClass: "A", trigger: "flap", locality, platform,
+        signals: { live, identityChanged: idChanged, deviceChanged: corroboratedDeviceChange, flap: { transitions: fs.transitions, countries: fs.countries, windowMs: p.W_FLAP_MS } },
       });
       continue;
     }
 
-    // TRIGGER B — TELEPORT: a baseline EXISTS and the current City,Country is outside
-    // it, persisting >= TELEPORT_MIN_POLLS consecutive LIVE polls (anti-jitter), gated
-    // on baseline-PRESENCE not a timer (D8). First suspicious poll -> T2 (arm fast-poll);
-    // the confirming poll -> T3 (burn-eligible in P3).
+    // TELEPORT: a baseline EXISTS and the current City,Country is outside it, live, gated
+    // on baseline-PRESENCE not a timer (D8).
     if (live && locality != null && !inBaseline) {
+      const baseCountries = new Set([...base.homeKeys].map(countryOf));
+      const crossCountry = !baseCountries.has(country);
+
+      // TIER B — teleport WITH a client-IDENTITY change. A different machine/client AND a
+      // moved location has no benign single-poll explanation -> burn on the FIRST poll
+      // (both platforms), skipping the persistence buffer. Clear any same-identity streak.
+      if (idChanged) {
+        pendingTeleport.delete(hash);
+        verdicts.push({
+          hash, tier: cap(3), tierClass: "B", trigger: "teleport", locality, platform,
+          signals: { live, identityChanged: true, deviceChanged: corroboratedDeviceChange, crossCountry, fastPath: true, teleport: { current: locality, baseline: [...base.homeKeys], persistedPolls: 1 } },
+        });
+        continue;
+      }
+
+      // ALLOWLIST (v2 §4): a same-identity teleport into an ACTIVE trusted locality is allowed
+      // SILENTLY (no verdict). Match a precise "City, Country" entry exactly OR a whole-country
+      // wildcard. This relaxes ONLY Tier C -- Tier A/B above already returned.
+      if (activeAllowlist && (activeAllowlist.has(locality) || activeAllowlist.has(country))) {
+        pendingTeleport.delete(hash);
+        continue;
+      }
+
+      // TIER C — same-identity teleport (the ambiguous geo case). Keep the v1 anti-jitter
+      // buffer: require >= TELEPORT_MIN_POLLS consecutive LIVE polls in the SAME locality
+      // before T3 (absorbs same-country metro-IP drift / a single bad geo read). First poll
+      // -> T2 (arm fast-poll). The P3 gate burns this for DESKTOP, alerts for MOBILE.
       const streak = pendingTeleport.get(hash);
       const count = streak && streak.locality === locality ? streak.count + 1 : 1;
       pendingTeleport.set(hash, { locality, count });
-      // HIGH-CONFIDENCE FAST PATH: a cross-COUNTRY teleport WITH a device-model change has no
-      // benign single-poll explanation -- you cannot change country AND machine in one poll. So
-      // burn on the FIRST poll, skipping the 2-poll persistence wait, landing the contested burn
-      // ~1 poll after the attacker connects. The persistence guard (the false-positive buffer) is
-      // KEPT for the ambiguous cases: same-country city jitter, metro-IP drift, or first travel to
-      // a new city in the SAME country, or a move with no device change, still require 2 polls.
-      const baseCountries = new Set([...base.homeKeys].map(countryOf));
-      const crossCountry = !baseCountries.has(country);
-      const highConfidence = crossCountry && corroboratedDeviceChange;
-      const tier = (highConfidence || count >= p.TELEPORT_MIN_POLLS) ? 3 : 2;
+      const tier = count >= p.TELEPORT_MIN_POLLS ? 3 : 2;
       verdicts.push({
-        hash, tier, trigger: "teleport", locality,
-        signals: { live, deviceChanged: corroboratedDeviceChange, crossCountry, fastPath: highConfidence, teleport: { current: locality, baseline: [...base.homeKeys], persistedPolls: count } },
+        hash, tier: cap(tier), tierClass: "C", trigger: "teleport", locality, platform,
+        signals: { live, identityChanged: false, deviceChanged: corroboratedDeviceChange, crossCountry, fastPath: false, teleport: { current: locality, baseline: [...base.homeKeys], persistedPolls: count } },
       });
       continue;
     }
@@ -186,7 +279,7 @@ export function classifyReplay(sessions, geoState, now, params = {}) {
     if (prevLocality != null && prevLocality !== locality && locality != null) {
       verdicts.push({
         hash, tier: 1, trigger: "advisory", locality,
-        signals: { live, deviceChanged: corroboratedDeviceChange },
+        signals: { live, identityChanged: idChanged, deviceChanged: corroboratedDeviceChange },
       });
     }
   }

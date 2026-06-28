@@ -44,6 +44,8 @@ const ACTION_LABELS = {
   // from these and matched exactly on both the web and gateway sides).
   "set-contest-protection": "change how your guard responds to a copied login",
   "set-allow-ip-jumping": "allow a device to change its location",
+  "set-locality-allowlist": "change your trusted locations",
+  "set-travel-mode": "turn travel mode on or off",
   "open-enroll": "open a short window to add a new device",
 };
 
@@ -93,7 +95,7 @@ function sameExcept(action, prev, core, changed) {
   // could smuggle a contest_protection / allow_ip_jumping / enroll_until change under a
   // signature meant for something else (arm/disarm the burn on a benign approval). Every
   // policy field the gateway derives MUST be pinned-equal for actions that don't change it.
-  for (const f of ["whitelist", "threshold", "reset_allowed_until", "signers", "contest_protection", "allow_ip_jumping", "enroll_until"]) {
+  for (const f of ["whitelist", "threshold", "reset_allowed_until", "signers", "contest_protection", "allow_ip_jumping", "enroll_until", "locality_allowlist", "travel_mode"]) {
     if (changed.includes(f)) continue;
     if (!canonicalEq(prev[f], core[f])) return `${action} may not change ${f}, but it did`;
   }
@@ -133,11 +135,32 @@ export function verifyDelta(action, prev, core) {
         ? null : "contest_protection must be off|alert|auto_burn";
     }
     case "set-allow-ip-jumping": {
+      // DEPRECATED (v2): no longer consumed by the detector/gate, but still verifiable so a
+      // pre-v2 chain that carries it stays valid. Shape-validated like before.
       const e = sameExcept(action, prev, core, ["allow_ip_jumping"]);
       if (e) return e;
       if (!Array.isArray(core.allow_ip_jumping) || core.allow_ip_jumping.length > 50) return "malformed allow_ip_jumping";
       if (core.allow_ip_jumping.some((h) => typeof h !== "string" || h.length > 64)) return "malformed allow_ip_jumping entry";
       return null;
+    }
+    case "set-locality-allowlist": {
+      const e = sameExcept(action, prev, core, ["locality_allowlist"]);
+      if (e) return e;
+      const al = core.locality_allowlist;
+      if (al != null) {
+        if (!Array.isArray(al) || al.length > 50) return "malformed locality_allowlist";
+        for (const en of al) {
+          if (!en || typeof en !== "object") return "malformed locality_allowlist entry";
+          if (typeof en.loc !== "string" || en.loc.length < 1 || en.loc.length > 96) return "malformed locality_allowlist loc";
+          if (en.until != null && (typeof en.until !== "string" || !Number.isFinite(new Date(en.until).getTime()))) return "malformed locality_allowlist until";
+        }
+      }
+      return null;
+    }
+    case "set-travel-mode": {
+      const e = sameExcept(action, prev, core, ["travel_mode"]);
+      if (e) return e;
+      return typeof core.travel_mode === "boolean" ? null : "travel_mode must be boolean";
     }
     case "open-enroll": {
       const e = sameExcept(action, prev, core, ["enroll_until"]);
@@ -448,8 +471,17 @@ export async function deriveAuthority(rows, cfg, anchor) {
       // anchor (payloadHash over the whole core) already covers these, so a State-Authority
       // rollback that resurrects an old value fails closed.
       contestProtection: c.contest_protection ?? "alert",
-      allowIpJumping: Array.isArray(c.allow_ip_jumping) ? c.allow_ip_jumping.map(String) : [],
+      allowIpJumping: Array.isArray(c.allow_ip_jumping) ? c.allow_ip_jumping.map(String) : [], // DEPRECATED (v2)
       enrollUntil: c.enroll_until ?? null,
+      // tdata-replay v2 (P3). Trusted-locations allowlist + travel-mode master toggle, read
+      // ONLY from the signed core. These RELAX Tier C in the brain (a safe direction); the
+      // dangerous burn-enable stays contestProtection==="auto_burn" in the EVICT gate.
+      localityAllowlist: Array.isArray(c.locality_allowlist)
+        ? c.locality_allowlist
+            .filter((e) => e && typeof e.loc === "string")
+            .map((e) => ({ loc: String(e.loc), until: e.until ?? null }))
+        : [],
+      travelMode: !!c.travel_mode,
       headVersion: head.version,
       headHash,
     },

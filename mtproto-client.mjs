@@ -242,6 +242,7 @@ function publicAuthFields(a) {
     hash: String(a.hash), current: !!a.current, unconfirmed: !!a.unconfirmed,
     deviceModel: a.deviceModel ?? null, platform: a.platform ?? null, systemVersion: a.systemVersion ?? null,
     appName: a.appName ?? null, appVersion: a.appVersion ?? null,
+    apiId: a.apiId == null ? null : Number(a.apiId), officialApp: a.officialApp == null ? null : !!a.officialApp,
     ip: a.ip ?? null, country: a.country ?? null, region: a.region ?? null,
     dateCreated: a.dateCreated ?? null, dateActive: a.dateActive ?? null,
   };

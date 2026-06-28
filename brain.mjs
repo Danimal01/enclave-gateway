@@ -26,6 +26,23 @@ export const DEFAULTS = Object.freeze({
   FRESH_WINDOW_MS: 24 * 60 * 60 * 1000,
 });
 
+// Resolve the signed trusted-locations allowlist (v2 §4) into the SET of localities active
+// right now: a permanent entry (until==null) is always active; a time-boxed entry is active
+// ONLY while the master travel_mode toggle is ON and now < until. Returns a Set of the `loc`
+// strings (country wildcards and/or "City, Country") for the detector to match against. The
+// allowlist relaxes ONLY Tier C; Tier A/B never consult it.
+export function resolveActiveAllowlist(list, travelMode, now) {
+  const active = new Set();
+  for (const e of Array.isArray(list) ? list : []) {
+    if (!e || typeof e.loc !== "string" || !e.loc) continue;
+    if (e.until == null) { active.add(e.loc); continue; } // permanent (home)
+    if (!travelMode) continue; // time-boxed entries require travel mode ON
+    const until = new Date(e.until).getTime();
+    if (Number.isFinite(until) && now < until) active.add(e.loc);
+  }
+  return active;
+}
+
 export class Brain {
   // deps:
   //   gateway: async call(op, arg) -> response body. In-process this dispatches
@@ -86,7 +103,12 @@ export class Brain {
     // + fast-poll. (P3 will turn a tier-3 verdict into a contested burn here.)
     let replayVerdicts = [];
     if (view.geo) {
-      try { replayVerdicts = classifyReplay(sessions, view.geo, this._now(), this._p.detect); }
+      // Resolve the ACTIVE trusted-locations allowlist from the SIGNED authority (permanent
+      // entries always; time-boxed only while travel_mode is on and unexpired) and pass it to
+      // the detector so an allowlisted same-identity teleport is suppressed silently (Tier C
+      // only; never Tier A/B). The allowlist is a RELAXATION; the burn-enable stays signed.
+      const activeAllowlist = resolveActiveAllowlist(view.localityAllowlist, view.travelMode, this._now());
+      try { replayVerdicts = classifyReplay(sessions, view.geo, this._now(), { ...this._p.detect, activeAllowlist }); }
       catch (e) { this._log(`[${acct}] classifyReplay failed: ${e.message}`); }
     }
 
@@ -122,19 +144,24 @@ export class Brain {
         && !(recentlyKilled && recentlyKilled.has(String(s.hash))))
       .sort((a, b) => Number(b.dateActive ?? 0) - Number(a.dateActive ?? 0));
 
-    // CONTESTED BURNS (P3). A tier-3 replay verdict (flap/teleport) marks an EXISTING hash,
-    // usually the victim's OWN whitelisted desktop, as a tdata replay. Burn it with
-    // contestOverride:true, which the gateway permits ONLY under the signed auto_burn policy
-    // (D4) -- the ENABLE is never sourced here, only the request. These run REGARDLESS of the
-    // fresh/enroll hold (a replay is not benign setup; D8: flap/teleport ignore the fresh
-    // window). NEVER current (the gate refuses it absolutely anyway). NO-2FA DEGRADATION:
-    // a forced re-login the attacker can also pass is not protection, so we burn unless 2FA
-    // is POSITIVELY known to be off; the replay_suspected alert already fired regardless.
-    const has2fa = view.has2fa !== false;
-    const burnEnabled = view.contestProtection === "auto_burn" && has2fa;
-    const tier3 = new Map((replayVerdicts ?? []).filter((v) => v.tier === 3).map((v) => [String(v.hash), v]));
-    if (tier3.size > 0 && view.contestProtection === "auto_burn" && !has2fa) {
-      this._log(`[${acct}] contested replay detected but the account has no 2FA — degraded to alert (no burn)`);
+    // CONTESTED BURNS (v2 §4/§5.3). A burnable replay verdict marks an EXISTING hash (usually
+    // the victim's OWN whitelisted desktop) as a tdata replay. Burn it with contestOverride:true,
+    // which the gateway permits ONLY under the signed auto_burn policy (D4) -- the ENABLE is never
+    // sourced here, only the request. PLATFORM-AWARE, ALLOWLIST-AWARE routing (a RELAXATION layer;
+    // the dangerous direction stays signed): Tier A (flap) + Tier B (client-identity change) burn
+    // on BOTH platforms; Tier C (same-identity teleport) burns ONLY on desktop -- mobile Tier C is
+    // alert-only (the replay_suspected already fired). The detector already suppressed allowlisted
+    // Tier C silently. These run REGARDLESS of the fresh/enroll hold (a replay is not benign setup;
+    // D8). NEVER current (the gate refuses it absolutely anyway). NO-2FA BURN (v2): the enable no
+    // longer requires 2FA -- in every contested case the attacker proved session-clone capability,
+    // not phone capability, so burning + forcing a phone-code re-login is protective without 2FA.
+    // Keep the 2FA NUDGE.
+    const burnEnabled = view.contestProtection === "auto_burn";
+    const tier3 = new Map((replayVerdicts ?? [])
+      .filter((v) => v.tier === 3 && (v.tierClass === "A" || v.tierClass === "B" || (v.tierClass === "C" && v.platform === "desktop")))
+      .map((v) => [String(v.hash), v]));
+    if (tier3.size > 0 && burnEnabled && view.has2fa === false) {
+      this._log(`[${acct}] contested burn without 2FA (protective: attacker holds a clone, not the phone code); nudge user to enable 2FA`);
     }
     const contestedBurns = burnEnabled
       ? [...tier3.keys()]
@@ -174,7 +201,7 @@ export class Brain {
             const v = tier3.get(String(s.hash));
             // Tag the row so the gateway emits contested_session_burned (with device_model),
             // not device_evicted, and sources the "please reconnect" text from the burn row.
-            evicted.push({ ...s, contested: true, trigger: v?.trigger ?? "replay", locality: v?.locality ?? s.country ?? null });
+            evicted.push({ ...s, contested: true, trigger: v?.trigger ?? "replay", tierClass: v?.tierClass ?? null, locality: v?.locality ?? s.country ?? null });
           } else {
             evicted.push(s);
           }
