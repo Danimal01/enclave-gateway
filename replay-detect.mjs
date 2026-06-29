@@ -186,9 +186,20 @@ export function classifyReplay(sessions, geoState, now, params = {}) {
     // (that is just learning the home, D9), so a freshly-enrolled device never self-flags.
     // enrolledFp/enrolledPlatform are captured ONCE here and never overwritten (§6).
     if (!baseline.has(hash)) {
+      // Do NOT seed from an UNPOPULATED first sighting. Telegram can report a just-created
+      // session with an empty country/device_model for a poll or two before it resolves the
+      // geo/identity. Seeding that empty baseline makes the first REAL poll read as a teleport
+      // (empty home -> city) AND an identity change (empty fp -> real fp), firing a false
+      // Tier B burn that even bypasses the trusted-locations allowlist -- the exact "kicked on
+      // my first reconnect, worked on the second" failure. Wait for a populated observation;
+      // still record the ring obs so liveness/flap history keeps building.
+      if (!locality || !device) {
+        pushRing(ring, hash, { locality, country, deviceModel: device, dateActive: s.dateActive ?? null, at: now, live }, p);
+        continue;
+      }
       baseline.set(hash, {
-        homeKeys: new Set(locality ? [locality] : []),
-        knownDevices: new Set(device ? [device] : []),
+        homeKeys: new Set([locality]),
+        knownDevices: new Set([device]),
         bornAt: now,
         seeded: true,
         enrolledFp: fp,
