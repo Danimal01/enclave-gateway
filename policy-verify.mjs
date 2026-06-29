@@ -29,6 +29,7 @@ import { keccak_256 } from "@noble/hashes/sha3.js";
 
 const RESET_WINDOW_MS = 8 * 24 * 60 * 60 * 1000;
 const ENROLL_WINDOW_MS = 30 * 60 * 1000; // MUST match lib/envelope.ts ENROLL_WINDOW_MS
+const TRAVEL_MAX_MS = 90 * 24 * 60 * 60 * 1000; // MUST match lib/envelope.ts TRAVEL_MAX_MS
 const ISSUED_FUTURE_SKEW_MS = 60 * 60 * 1000;
 
 const ACTION_LABELS = {
@@ -46,6 +47,8 @@ const ACTION_LABELS = {
   "set-allow-ip-jumping": "allow a device to change its location",
   "set-locality-allowlist": "change your trusted locations",
   "set-travel-mode": "turn travel mode on or off",
+  "set-country-allowlist": "change your trusted countries",
+  "set-travel-window": "set your travel window",
   "open-enroll": "open a short window to add a new device",
 };
 
@@ -95,7 +98,7 @@ function sameExcept(action, prev, core, changed) {
   // could smuggle a contest_protection / allow_ip_jumping / enroll_until change under a
   // signature meant for something else (arm/disarm the burn on a benign approval). Every
   // policy field the gateway derives MUST be pinned-equal for actions that don't change it.
-  for (const f of ["whitelist", "threshold", "reset_allowed_until", "signers", "contest_protection", "allow_ip_jumping", "enroll_until", "locality_allowlist", "travel_mode"]) {
+  for (const f of ["whitelist", "threshold", "reset_allowed_until", "signers", "contest_protection", "allow_ip_jumping", "enroll_until", "locality_allowlist", "travel_mode", "country_allowlist", "travel_until"]) {
     if (changed.includes(f)) continue;
     if (!canonicalEq(prev[f], core[f])) return `${action} may not change ${f}, but it did`;
   }
@@ -161,6 +164,27 @@ export function verifyDelta(action, prev, core) {
       const e = sameExcept(action, prev, core, ["travel_mode"]);
       if (e) return e;
       return typeof core.travel_mode === "boolean" ? null : "travel_mode must be boolean";
+    }
+    case "set-country-allowlist": {
+      const e = sameExcept(action, prev, core, ["country_allowlist"]);
+      if (e) return e;
+      const al = core.country_allowlist;
+      if (al != null) {
+        if (!Array.isArray(al) || al.length > 50) return "malformed country_allowlist";
+        if (al.some((c) => typeof c !== "string" || !/^[A-Z]{2}$/.test(c))) return "country_allowlist must be ISO-2 codes";
+      }
+      return null;
+    }
+    case "set-travel-window": {
+      const e = sameExcept(action, prev, core, ["travel_until"]);
+      if (e) return e;
+      if (core.travel_until == null) return null; // disarming travel mode
+      const until = new Date(core.travel_until).getTime();
+      const issued = new Date(core.issued_at).getTime();
+      if (!Number.isFinite(until) || !Number.isFinite(issued)) return "travel_until malformed";
+      if (until < issued - 60_000) return "travel window must be in the future";
+      if (until - issued > TRAVEL_MAX_MS) return "travel window too long";
+      return null;
     }
     case "open-enroll": {
       const e = sameExcept(action, prev, core, ["enroll_until"]);
@@ -481,7 +505,13 @@ export async function deriveAuthority(rows, cfg, anchor) {
             .filter((e) => e && typeof e.loc === "string")
             .map((e) => ({ loc: String(e.loc), until: e.until ?? null }))
         : [],
-      travelMode: !!c.travel_mode,
+      travelMode: !!c.travel_mode, // DEPRECATED (UX v2)
+      // UX v2: trusted countries (ISO-2) + the Travel Mode window. Read ONLY from the signed
+      // core; the brain RELAXES Tier C with these (safe direction), never arms a burn.
+      countryAllowlist: Array.isArray(c.country_allowlist)
+        ? c.country_allowlist.filter((cc) => typeof cc === "string").map((cc) => cc.toUpperCase())
+        : [],
+      travelUntil: c.travel_until ?? null,
       headVersion: head.version,
       headHash,
     },

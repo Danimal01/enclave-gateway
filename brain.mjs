@@ -20,25 +20,37 @@
 // with no logic rewrite.
 
 import { classifyReplay } from "./replay-detect.mjs";
+import { countryNameToIso2, countryOf } from "./locality-match.mjs";
 
 export const DEFAULTS = Object.freeze({
   MAX_EVICT_PER_SWEEP: 3,
   FRESH_WINDOW_MS: 24 * 60 * 60 * 1000,
 });
 
-// Resolve the signed trusted-locations allowlist (v2 §4) into the SET of localities active
-// right now: a permanent entry (until==null) is always active; a time-boxed entry is active
-// ONLY while the master travel_mode toggle is ON and now < until. Returns a Set of the `loc`
-// strings (country wildcards and/or "City, Country") for the detector to match against. The
-// allowlist relaxes ONLY Tier C; Tier A/B never consult it.
-export function resolveActiveAllowlist(list, travelMode, now) {
+// Resolve, for THIS roster, the set of localities that are geo-trusted right now (UX v2). A
+// locality is trusted if: Travel Mode is active (now < travel_until → ALL new locations), OR
+// it is an exact trusted CITY (verbatim), OR its country resolves to a trusted ISO-2 COUNTRY.
+// FAIL-OPEN: a country name the resolver cannot recognize is treated as trusted (never burn a
+// user we cannot classify) and emits an ops near-miss log (the canary for a Telegram rename).
+// Relaxes ONLY Tier C; Tiers A/B never consult this. `log` is the gateway logger (ops-only).
+export function resolveActiveAllowlist({ sessions, cities, countries, travelUntil, now, log, acct }) {
   const active = new Set();
-  for (const e of Array.isArray(list) ? list : []) {
-    if (!e || typeof e.loc !== "string" || !e.loc) continue;
-    if (e.until == null) { active.add(e.loc); continue; } // permanent (home)
-    if (!travelMode) continue; // time-boxed entries require travel mode ON
-    const until = new Date(e.until).getTime();
-    if (Number.isFinite(until) && now < until) active.add(e.loc);
+  const travelActive = !!travelUntil && Number.isFinite(new Date(travelUntil).getTime()) && now < new Date(travelUntil).getTime();
+  const citySet = new Set((Array.isArray(cities) ? cities : []).map((e) => e && e.loc).filter(Boolean));
+  const countrySet = new Set((Array.isArray(countries) ? countries : []).map((c) => String(c).toUpperCase()));
+  for (const s of sessions ?? []) {
+    const loc = s && typeof s.country === "string" ? s.country : null;
+    if (!loc || active.has(loc)) continue;
+    if (travelActive) { active.add(loc); continue; }
+    if (citySet.has(loc)) { active.add(loc); continue; }
+    const iso2 = countryNameToIso2(countryOf(loc));
+    if (iso2 === null) {
+      // Unknown country name: fail open (do not burn) + ops near-miss canary.
+      active.add(loc);
+      try { log?.(`[${acct ?? "?"}] GEO_NEARMISS unresolved country=${JSON.stringify(countryOf(loc))}`); } catch { /* best-effort */ }
+      continue;
+    }
+    if (countrySet.has(iso2)) active.add(loc);
   }
   return active;
 }
@@ -103,11 +115,14 @@ export class Brain {
     // + fast-poll. (P3 will turn a tier-3 verdict into a contested burn here.)
     let replayVerdicts = [];
     if (view.geo) {
-      // Resolve the ACTIVE trusted-locations allowlist from the SIGNED authority (permanent
-      // entries always; time-boxed only while travel_mode is on and unexpired) and pass it to
-      // the detector so an allowlisted same-identity teleport is suppressed silently (Tier C
-      // only; never Tier A/B). The allowlist is a RELAXATION; the burn-enable stays signed.
-      const activeAllowlist = resolveActiveAllowlist(view.localityAllowlist, view.travelMode, this._now());
+      // Resolve, for this roster, which localities are geo-trusted NOW from the SIGNED authority
+      // (UX v2: trusted CITIES verbatim, trusted COUNTRIES by ISO-2, or an active Travel Mode
+      // window). Fail-open on an unresolved country (never burn a user we can't classify) + ops
+      // near-miss canary. Suppresses Tier C ONLY; Tiers A/B never consult it; burn-enable stays signed.
+      const activeAllowlist = resolveActiveAllowlist({
+        sessions, cities: view.localityAllowlist, countries: view.countryAllowlist,
+        travelUntil: view.travelUntil, now: this._now(), log: this._log?.bind(this), acct,
+      });
       try { replayVerdicts = classifyReplay(sessions, view.geo, this._now(), { ...this._p.detect, activeAllowlist }); }
       catch (e) { this._log(`[${acct}] classifyReplay failed: ${e.message}`); }
     }

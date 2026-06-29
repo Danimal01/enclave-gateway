@@ -370,7 +370,9 @@ export class Gateway {
       // brain resolves the ACTIVE set (permanent always; time-boxed only when travelMode is on
       // and unexpired) and passes it to classifyReplay to suppress Tier C silently (never A/B).
       localityAllowlist: ctx.authority.localityAllowlist ?? [],
-      travelMode: !!ctx.authority.travelMode,
+      travelMode: !!ctx.authority.travelMode, // DEPRECATED (UX v2)
+      countryAllowlist: ctx.authority.countryAllowlist ?? [],
+      travelUntil: ctx.authority.travelUntil ?? null,
       // No-2FA degradation input (P3): true/false once the security check has read the
       // account, undefined before. The brain burns unless this is POSITIVELY false (a
       // forced re-login the attacker can also pass without 2FA is not protection).
