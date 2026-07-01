@@ -12,7 +12,7 @@ What it *can* do — watch for new logins, remove a session that is not on your
 signed keep-list, decline a hostile 2FA-password reset, and surface those events
 to you — is the entire surface, enumerated in one file you can audit.
 
-> **Current live release: `v1.1.2`, enclave fingerprint PCR0 `2cda6d55ed4a8187d2c072f7b93547f5047d05c92dafe752274200b2bd2d6889512d5d84612746991ca55d6a2aa3fa1e`** (`v1.1.2` is a detector robustness fix: it no longer seeds a session's baseline from an unpopulated first sighting, which could cause a false sign-out on a reconnect's first try; capability-neutral, so the allowlist is byte-identical to `v1.1.1`).
+> **Current live release: `v1.1.3`, enclave fingerprint PCR0 `4a86e0c09a97026f74a576fe60331d55bdcbbfe109bcb36c1a2a4c5c3126c089211f6379659322340b58f3e25d50cce8`** (`v1.1.3` is a database-egress fix: the per-sweep policy-chain pre-checks now use a cheap head-only probe instead of re-reading the full signed chain every ~2s; capability-neutral, so the allowlist is byte-identical to `v1.1.2`).
 > **`RELEASE.json` is the single authoritative, machine-readable record of this build.** Only the fingerprint shown here is live. If you encounter any other PCR0 — in an older commit message, an old tag, or a cached page — it is a *superseded* release, not the current one. When in doubt, read `RELEASE.json` and the raw source files directly, not rendered or cached views.
 
 ## Why this exists (the problem the off-the-shelf stack can't solve)
@@ -103,7 +103,7 @@ reproduces the identical PCR0 you see here. `RELEASE.json` is the authoritative 
 commit and tag it names simply timestamp exactly this source in the public history.
 
 ```
-PCR0_G = 2cda6d55ed4a8187d2c072f7b93547f5047d05c92dafe752274200b2bd2d6889512d5d84612746991ca55d6a2aa3fa1e
+PCR0_G = 4a86e0c09a97026f74a576fe60331d55bdcbbfe109bcb36c1a2a4c5c3126c089211f6379659322340b58f3e25d50cce8
 ```
 
 Verify it yourself:
@@ -125,7 +125,7 @@ Verify it yourself:
    > each is simply what a different verifier (a shell vs the attestation) computes over
    > the same file.
 3. **Rebuild it.** Follow `BUILD.md`; the PCR0 you get must equal the value above
-   (`2cda6d55…aa3fa1e`) the same value `RELEASE.json` and the live attestation report.
+   (`4a86e0c0…d50cce8`) the same value `RELEASE.json` and the live attestation report.
 
 ## License
 

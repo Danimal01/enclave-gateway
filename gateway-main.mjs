@@ -278,6 +278,18 @@ async function loadConfig() {
       const rows = await db.from("policy_envelopes").select("version,action,core,core_hash,sigs").eq("link_id", linkId).order("version", { ascending: true });
       return (rows?.data ?? rows ?? []).map((r) => ({ version: r.version, action: r.action, core: r.core, core_hash: r.core_hash, sigs: r.sigs }));
     },
+    // policyHead: the CHEAP steady-state probe — only the chain head's version +
+    // action, NONE of the fat core/sigs blobs. reconcilePolicy runs every sweep
+    // (~2s) purely to notice a newer head; pulling the whole ~1.3KB/row chain each
+    // time was ~all of our Supabase egress. This returns ~10 bytes instead, and
+    // the full chain (policyStore) is fetched only when the head has advanced.
+    policyHead: async (linkId) => {
+      // .maybeSingle() (NOT .limit(1) — the pg-shim has no .limit; single => LIMIT 1)
+      // so ORDER BY version DESC + LIMIT 1 returns just the head row's two columns.
+      const r = await db.from("policy_envelopes").select("version,action").eq("link_id", linkId).order("version", { ascending: false }).maybeSingle();
+      const row = r?.data ?? null;
+      return row ? { version: row.version, action: row.action } : null;
+    },
     emitNewAuth: () => {},   // wired to the brain channel when the brain attaches
     onAutoReconnect: async () => {},
     logger: (message) => console.log(message),
@@ -326,6 +338,7 @@ export async function main() {
     openEnvelopeV3,
     authorityClient,
     policyStore: cfg.policyStore,              // narrow guard_gateway SELECT on policy_envelopes
+    policyHead: cfg.policyHead,                // cheap head-only probe (version+action, no blobs) for steady-state sweeps
     verifierCfg: { rpId: cfg.WEBAUTHN_RP_ID, origins: cfg.WEBAUTHN_ORIGINS, googleClientId: cfg.GOOGLE_CLIENT_ID },
     // transportFactory builds the forked-connection armed transport. The
     // connection owns its chokepoint and installs the audited serialization (the

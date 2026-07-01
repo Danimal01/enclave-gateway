@@ -747,19 +747,30 @@ export class Gateway {
   async reconcileDisconnect(handle) {
     const ctx = this._accts.get(handle);
     if (!ctx) return null;
-    const { authorityClient, policyStore, verifierCfg } = this._d;
+    const { authorityClient, policyStore, policyHead, verifierCfg } = this._d;
 
-    // Cheap pre-check OUTSIDE the per-account lock: act only when the fresh signed
-    // chain's head is a disconnect (the common case is no-op).
-    let rows;
-    try { rows = await policyStore(ctx.linkId); }
-    catch (e) { this._d.logger?.(`disconnect: policy read failed for ${ctx.linkId}: ${e.message}`); return null; }
-    const ordered = [...(rows ?? [])].sort((a, b) => a.version - b.version);
-    const head = ordered[ordered.length - 1];
-    if (!head || String(head.action) !== "disconnect") return null;
+    // Cheap pre-check OUTSIDE the per-account lock: probe ONLY the chain head's
+    // {version, action} (no core/sigs blobs) and act only when it is a disconnect.
+    // This runs every sweep (~2s); pulling the full chain here just to read the head
+    // action was a per-sweep egress drain equal to reconcilePolicy's. The full chain
+    // is fetched (inside the lock, below) ONLY when the head is actually a disconnect.
+    let probe;
+    try { probe = policyHead ? await policyHead(ctx.linkId) : (await policyStore(ctx.linkId)).sort((a, b) => b.version - a.version)[0]; }
+    catch (e) { this._d.logger?.(`disconnect: head read failed for ${ctx.linkId}: ${e.message}`); return null; }
+    if (!probe || String(probe.action) !== "disconnect") return null;
 
     return this._runSerial(ctx, async () => {
       if (!this._accts.has(handle)) return null; // dropped while we waited for the lock
+
+      // Head is a disconnect: NOW fetch the full signed chain for the fail-closed
+      // re-verify (fetched inside the lock so a concurrent append can't split the
+      // head probe from the body we verify).
+      let rows;
+      try { rows = await policyStore(ctx.linkId); }
+      catch (e) { this._d.logger?.(`disconnect: policy read failed for ${ctx.linkId}: ${e.message}`); return null; }
+      const ordered = [...(rows ?? [])].sort((a, b) => a.version - b.version);
+      const head = ordered[ordered.length - 1];
+      if (!head || String(head.action) !== "disconnect") return null; // raced/changed since the probe
 
       // If the State Authority is already TERMINAL, the logout/terminalize ran on a
       // prior (interrupted) pass; finish the DB finalize + drop idempotently.
@@ -836,23 +847,38 @@ export class Gateway {
   async reconcilePolicy(handle) {
     const pre = this._accts.get(handle);
     if (!pre) return null;
-    const { authorityClient, policyStore, verifierCfg } = this._d;
+    const { authorityClient, policyStore, policyHead, verifierCfg } = this._d;
 
     // Cheap pre-check OUTSIDE the per-account lock (mirror reconcileDisconnect):
-    // act only when the fresh signed chain head is newer than what we enforce.
-    let rows;
-    try { rows = await policyStore(pre.linkId); }
-    catch (e) { this._d.logger?.(`policy: read failed for ${pre.linkId}: ${e.message}`); return null; }
-    const ordered = [...(rows ?? [])].sort((a, b) => a.version - b.version);
-    const head = ordered[ordered.length - 1];
-    if (!head) return null;
-    if (String(head.action) === "disconnect") return null;            // reconcileDisconnect owns the disconnect head
-    if (head.version <= (pre.authority?.headVersion ?? 1)) return null; // steady-state no-op, zero SA traffic
+    // act only when the fresh signed chain HEAD is newer than what we enforce.
+    // This probe reads ONLY {version, action} of the head row (no core/sigs
+    // blobs). This runs every sweep (~2s); fetching the full chain here just to
+    // compare head.version was essentially all of our Supabase egress. The full
+    // signed chain is now pulled (inside the lock, below) ONLY when the head has
+    // actually advanced, i.e. when there is real new policy to verify+enforce.
+    let probe;
+    try { probe = policyHead ? await policyHead(pre.linkId) : (await policyStore(pre.linkId)).sort((a, b) => b.version - a.version)[0]; }
+    catch (e) { this._d.logger?.(`policy: head read failed for ${pre.linkId}: ${e.message}`); return null; }
+    if (!probe) return null;
+    if (String(probe.action) === "disconnect") return null;            // reconcileDisconnect owns the disconnect head
+    if (probe.version <= (pre.authority?.headVersion ?? 1)) return null; // steady-state no-op, zero chain egress
 
     return this._runSerial(pre, async () => {
       // Re-fetch the LIVE ctx inside the lock: a concurrent recover can swap it.
       const ctx = this._accts.get(handle);
       if (!ctx) return null;
+
+      // Head advanced: NOW pull the full signed chain for the one-time re-verify.
+      // Fetched inside the lock so a concurrent writer's in-flight append can't
+      // split the head probe from the body we verify.
+      let rows;
+      try { rows = await policyStore(ctx.linkId); }
+      catch (e) { this._d.logger?.(`policy: read failed for ${ctx.linkId}: ${e.message}`); return null; }
+      const ordered = [...(rows ?? [])].sort((a, b) => a.version - b.version);
+      const head = ordered[ordered.length - 1];
+      if (!head) return null;
+      if (String(head.action) === "disconnect") return null;             // disconnect head appeared under us -> reconcileDisconnect owns it
+      if (head.version <= (ctx.authority?.headVersion ?? 1)) return null; // raced/converged since the probe -> nothing to do
 
       let rec;
       try { rec = await authorityClient.read(ctx.stateId); }

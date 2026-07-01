@@ -24,7 +24,7 @@ function colList(sel) {
     .join(", ");
 }
 
-class QB {
+export class QB {
   constructor(pool, table) {
     this.pool = pool;
     this.table = table;
